@@ -3,236 +3,275 @@
 # Constants
 declare -r CONFIG_DIR="${HOME}/.netwatcher"
 declare -r CONFIG_FILE="${CONFIG_DIR}/config"
+declare -r NETWATCHER_SCRIPT="${HOME}/Library/Scripts/netwatcher"
 
-# Functions
-ask ()
-{
-	local done=false
-	while [[ $done == false ]]; do
-		printf " (y/n) "
-		read reply
-		done=true
-		case $reply in
-			n | N | no | NO	  ) answer="n"	;;
-			y | Y | yes | YES ) answer="y" ;;
-			*				  ) printf "\nInvalid response. Try again:"
-								done=false ;;
-		esac
-	done
+# Function to ask a yes/no question
+ask() {
+  local done="false"
+  while [[ ${done} == "false" ]]; do
+    printf " (y/n) "
+    read reply
+    done="true"
+    case ${reply} in
+      n | N | no | NO   ) answer="n" ;;
+      y | Y | yes | YES ) answer="y" ;;
+      *                 ) printf "\nInvalid response. Try again:"
+                         done="false" ;;
+    esac
+  done
 }
 
-collect_response ()
-{
-	local question="$1"
-	local default="$2"
-	local done=false
-
-	while [[ $done == false ]]; do
-		printf "${question}\n"
-		printf "[ Enter = $default ]: "
-		read response
-		[[ -z $response ]] && response="$default"
-		printf "Is \"$response\" correct? (y/n) "
-		read reply
-		case $reply in
-			n | N | no | NO	  ) done=false ;;
-			y | Y | yes | YES ) done=true  ;;
-			*				  ) printf "\nInvalid response. Try again:" ;;
-		esac
-	done
+# Function to collect a response with a default value
+collect_response() {
+  local question="$1"
+  local default="$2"
+  printf "${question}\n"
+  printf "[ Enter = ${default} ]: "
+  read response
+  [[ -z ${response} ]] && response="${default}"
 }
 
-uninstall ()
-{
-	 launchctl unload \
-		 ~/Library/LaunchAgents/local.netwatcher.plist > /dev/null 2>&1
-	 rm -f ~/Library/Scripts/netwatcher
-	 rm -f ~/Library/LaunchAgents/local.netwatcher.plist
-	 rm -f ~/Library/Logs/netwatcher.log
-	 rm -rf "$CONFIG_DIR"
-	 printf "Uninstall complete\n"
-	 exit 0
+# Function to uninstall netwatcher
+uninstall() {
+  launchctl unload \
+    ~/Library/LaunchAgents/local.netwatcher.plist > /dev/null 2>&1
+  rm -f ~/Library/Scripts/netwatcher
+  rm -f ~/Library/LaunchAgents/local.netwatcher.plist
+  rm -f ~/Library/LaunchAgents/local.netwatcher
+  rm -f ~/Library/Logs/netwatcher.log
+  rm -rf "${CONFIG_DIR}"
+  printf "Uninstall complete\n"
+  exit 0
 }
 
-usage ()
-{
-	cat<<EOF
+# Function to display usage information
+usage() {
+  cat <<EOF
 Usage: $(basename $0) [-u] [-r] [-t secs] [-p secs]
-	   -u Stop and uninstall
-	   -r Reinstall (re-ask setup questions)
-	   -t Time (in seconds) that must pass between network changes for them to be considered valid
-	   -p Time (in seconds) to pause before evaluating a network change to allow interfaces to settle
+       -u Stop and uninstall
+       -r Reinstall (re-ask setup questions)
+       -t Time (in seconds) that must pass between network changes for them to be considered valid
+       -p Time (in seconds) to pause before evaluating a network change to allow interfaces to settle
 
 Example: $0 -t 5 -p 3
 
 EOF
-	 exit 0
+  exit 0
 }
 
-errtrap ()
-{	# Die if we trap an error
-	 printf "ERROR line ${1}: Command exited with status ${?}.\n" |\
-	 exit 1
+# Function to check bash version
+check_bash_version() {
+  local bash_path="$1"
+  if [[ -x ${bash_path} ]]; then
+    local bash_version=$(${bash_path} --version | head -n 1 | awk '{print $4}')
+    if [[ ${bash_version} =~ ^[45] ]]; then
+      return 0
+    else
+      printf "Bash version at ${bash_path} is not 4.x or higher.\n"
+      return 1
+    fi
+  else
+    printf "Bash not found at ${bash_path}.\n"
+    return 1
+  fi
 }
 
-#-------------------------------------------------------------------------------
-# Main script
-while getopts ":urt:p:" OPTION; do
-	 case $OPTION in
-		  u) uninstall=true ;;
-		  r) reinstall=true ;;
-		  t) throttle=true
-			 throttle_time=$OPTARG ;;
-		  p) pause_to_settle=true
-			 pause_time=$OPTARG ;;
-		  ?) usage ;;
-	 esac
-done
-shift $(( OPTIND-1 ))
+# Function to update shebang line in netwatcher script
+update_shebang() {
+  local bash_path="$1"
+  sed -i "1s|#!.*|#!${bash_path}|" ${NETWATCHER_SCRIPT}
+  printf "Updated shebang line in ${NETWATCHER_SCRIPT} to #!${bash_path}\n"
+}
 
-# trap errors
-trap 'errtrap ${LINENO}' ERR
+# Main function
+main() {
+  # Check if running as root
+  if [[ ${EUID} -eq 0 ]]; then
+    printf "This script should not be run as root\n"
+    exit 1
+  fi
 
-[[ $uninstall == true ]] && uninstall
-[[ $reinstall == true ]] && rm -f $CONFIG_FILE
+  while getopts ":urt:p:" OPTION; do
+    case ${OPTION} in
+      u) uninstall="true" ;;
+      r) reinstall="true" ;;
+      t) throttle="true"
+         throttle_time=${OPTARG} ;;
+      p) pause_to_settle="true"
+         pause_time=${OPTARG} ;;
+      ?) usage ;;
+    esac
+  done
+  shift $(( OPTIND-1 ))
 
-# Stop existing install
-launchctl unload \
-		 ~/Library/LaunchAgents/local.netwatcher.plist > /dev/null 2>&1
+  # Uninstall if the uninstall flag is set
+  [[ ${uninstall} == "true" ]] && uninstall
 
-# Load previous settings
-if [[ -r $CONFIG_FILE ]]; then
-	source $CONFIG_FILE
-	printf "Using existing $CONFIG_FILE\n"
+  # Reinstall if the reinstall flag is set
+  [[ ${reinstall} == "true" ]] && rm -f ${CONFIG_FILE}
 
-else
-	# Collect settings
-	mkdir -p "$CONFIG_DIR"
-	touch "$CONFIG_FILE"
+  # Stop existing install
+  launchctl unload \
+    ~/Library/LaunchAgents/local.netwatcher.plist > /dev/null 2>&1 || {
+    printf "Error: Failed to unload LaunchAgent\n"
+    exit 1
+  }
 
-	printf "Do you want to watch for wired ethernet connections?" ; ask
-	if [[ $answer == y ]]; then
-		printf "ETHERNET=true\n" >> $CONFIG_FILE
-	else
-		printf "ETHERNET=false\n" >> $CONFIG_FILE
-	fi
+  # Create the LaunchAgent plist file from the template
+  cat $(dirname $0)/Library/LaunchAgents/local.netwatcher.plist_template | sed "s|USERX|${USER}|g" > $(dirname $0)/Library/LaunchAgents/local.netwatcher.plist || {
+    printf "Error: Failed to create LaunchAgent plist from template\n"
+    exit 1
+  }
+  cp -r $(dirname $0)/Library ~/ || {
+    printf "Error: Failed to copy Library files\n"
+    exit 1
+  }
 
-	ls -d "/Applications/Adium.app" > /dev/null 2>&1
-	if (( $? == 0 )); then
-		printf "Do you want to change your status in Adium when your connection changes?" ; ask
-		if [[ $answer == y ]]; then
-			collect_response "Enter your Adium account username" "$(id -un)"
-			printf "ADIUM_ACCOUNT=\"$response\"\n" >> $CONFIG_FILE
-			printf "\nModify $CONFIG_FILE to change the status messages\n"
-			printf "ADIUM=\"true\"\n" >> $CONFIG_FILE
-			printf "ADIUM_WORK_STATUS=\"Away\"\n" >> $CONFIG_FILE
-			printf "ADIUM_HOME_STATUS=\"Offline\"\n" >> $CONFIG_FILE
-		fi
-	else
-		printf "ADIUM_ACCOUNT=\"none\"\n" >> $CONFIG_FILE
-		printf "ADIUM=\"false\"\n" >> $CONFIG_FILE
-		printf "ADIUM_WORK_STATUS=\"Away\"\n" >> $CONFIG_FILE
-		printf "ADIUM_HOME_STATUS=\"Offline\"\n" >> $CONFIG_FILE
-	fi
+  # Ensure netwatcher script is copied to the correct location and is executable
+  if [[ ! -f ${NETWATCHER_SCRIPT} ]]; then
+    cp $(dirname $0)/Scripts/netwatcher ${NETWATCHER_SCRIPT} || {
+      printf "Error: Failed to copy netwatcher script\n"
+      exit 1
+    }
+    chmod +x ${NETWATCHER_SCRIPT} || {
+      printf "Error: Failed to make netwatcher script executable\n"
+      exit 1
+    }
+  fi
 
-	ls -d "/Applications/Cisco/Cisco AnyConnect Secure Mobility Client.app" > /dev/null 2>&1
-	if (( $? == 0 )); then
-		printf "CISCO_ANYCONNECT=\"true\"\n" >> $CONFIG_FILE
-	else
-		printf "CISCO_ANYCONNECT=\"false\"\n" >> $CONFIG_FILE
-	fi
+  # Verify bash version
+  if ! check_bash_version "/opt/homebrew/bin/bash"; then
+    printf "Please provide the full path to a bash version 4.x or higher: "
+    read user_bash_path
+    while ! check_bash_version "${user_bash_path}"; do
+      printf "Invalid bash path or version. Please provide the full path to a bash version 4.x or higher: "
+      read user_bash_path
+    done
+    update_shebang "${user_bash_path}"
+  else
+    update_shebang "/opt/homebrew/bin/bash"
+  fi
 
-	ls -d "/Applications/Dropbox.app" > /dev/null 2>&1
-	if (( $? == 0 )); then
-		printf "DROPBOX=\"true\"\n" >> $CONFIG_FILE
-	else
-		printf "DROPBOX=\"false\"\n" >> $CONFIG_FILE
-	fi
+  # Load previous settings if the config file exists
+  if [[ -r ${CONFIG_FILE} ]]; then
+    source ${CONFIG_FILE}
+    printf "Using existing ${CONFIG_FILE}\n"
 
-	ls -d "/Applications/nextcloud.app" > /dev/null 2>&1
-	if (( $? == 0 )); then
-		printf "NEXTCLOUD=\"true\"\n" >> $CONFIG_FILE
-	else
-		printf "NEXTCLOUD=\"false\"\n" >> $CONFIG_FILE
-	fi
+  else
+    # Collect settings
+    mkdir -p "${CONFIG_DIR}"
+    touch "${CONFIG_FILE}"
 
-	ls -d "/Applications/Oracle Documents.app" > /dev/null 2>&1
-	if (( $? == 0 )); then
-		printf "ORADOCS=\"true\"\n" >> $CONFIG_FILE
-	else
-		printf "ORADOCS=\"false\"\n" >> $CONFIG_FILE
-	fi
+    # Ask if the user wants to watch for wired ethernet connections
+    printf "Do you want to watch for wired ethernet connections?" ; ask
+    if [[ ${answer} == "y" ]]; then
+      printf "ETHERNET=\"true\"\n" >> ${CONFIG_FILE}
+    else
+      printf "ETHERNET=\"false\"\n" >> ${CONFIG_FILE}
+    fi
 
-	ls -d "/Applications/Proxifier.app" > /dev/null 2>&1
-	if (( $? == 0 )); then
-		printf "PROXIFIER=\"true\"\n" >> $CONFIG_FILE
-	else
-		printf "PROXIFIER=\"false\"\n" >> $CONFIG_FILE
-	fi
+    # List installed printers and collect work and home printer names
+    if ! lpstat -p > /dev/null 2>&1; then
+      printf "Warning: Unable to get printer list. Printer setup skipped.\n"
+      printf "WORK_PRINTER=\"none\"\n" >> ${CONFIG_FILE}
+      printf "HOME_PRINTER=\"none\"\n" >> ${CONFIG_FILE}
+    else
+      printf "\nThe following printers are installed:\n\n"
+      lpstat -p | awk '/^printer/ { print $2 }'
+      printf "\n$(lpstat -d)\n\n"
+      default_printer=$(lpstat -d | awk '{ print $NF }')
+      collect_response "Enter the name of your work printer or \"none\" to disable this feature" "${default_printer}"
+      printf "WORK_PRINTER=\"${response}\"\n" >> ${CONFIG_FILE}
+      collect_response "Enter the name of your home printer or \"none\" to disable this feature" "${default_printer}"
+      printf "HOME_PRINTER=\"${response}\"\n" >> ${CONFIG_FILE}
+    fi
 
-	printf "\nThe following printers are installed:\n\n"
-	lpstat -p | awk '/^printer/ { print $2 }'
-	printf "\n$(lpstat -d)\n\n"
-	default_printer=$(lpstat -d | awk '{ print $NF }')
-	collect_response "Enter the name of your work printer or \"none\" to disable this feature" "$default_printer"
-	printf "WORK_PRINTER=\"$response\"\n" >> $CONFIG_FILE
-	collect_response "Enter the name of your home printer or \"none\" to disable this feature" "$default_printer"
-	printf "HOME_PRINTER=\"$response\"\n" >> $CONFIG_FILE
+    # Check if terminal-notifier is installed
+    PATH=/opt/homebrew/bin:/usr/local/bin:${PATH}
+    if which -s terminal-notifier; then
+      printf "Do you want to enable Notification Center alerts?" ; ask
+      if [[ ${answer} == "y" ]]; then
+        printf "NOTIFICATION_CENTER=\"true\"\n" >> ${CONFIG_FILE}
+      else
+        printf "NOTIFICATION_CENTER=\"false\"\n" >> ${CONFIG_FILE}
+      fi
+    else
+      printf "terminal-notifier not found. Notification Center alerts disabled.\n"
+      printf "NOTIFICATION_CENTER=\"false\"\n" >> ${CONFIG_FILE}
+    fi
 
-	PATH=/usr/local/bin:${PATH} which -s terminal-notifier
-	if (( $? == 0 )); then
-		printf "Do you want to enable Notification Center alerts?" ; ask
-		if [[ $answer == y ]]; then
-			printf "NOTIFICATION_CENTER=true\n" >> $CONFIG_FILE
-		else
-			printf "NOTIFICATION_CENTER=false\n" >> $CONFIG_FILE
-		fi
-	else
-		printf "NOTIFICATION_CENTER=false\n" >> $CONFIG_FILE
-	fi
+    # Collect various network-related settings
+    collect_response "Enter the IP address pattern for your workplace" "10.[0-9][0-9][0-9]"
+    printf "WORK_IP_PATTERN=\"${response}\"\n" >> ${CONFIG_FILE}
 
-	collect_response "Enter the IP address pattern of your workplace" "10.[0-9][0-9][0-9]"
-	printf "WORK_IP_PATTERN=\"$response\"\n" >> $CONFIG_FILE
+    collect_response "Enter the domain suffix pattern for your workplace" "example.com"
+    printf "WORK_DOMAIN_PATTERN=\"${response}\"\n" >> ${CONFIG_FILE}
 
-	collect_response "Enter the domain suffix pattern of your workplace" "example.com"
-	printf "WORK_DOMAIN_PATTERN=\"$response\"\n" >> $CONFIG_FILE
+    collect_response "Enter the SSID for your workplace" "corporate-ssid"
+    printf "WORK_SSID=\"${response}\"\n" >> ${CONFIG_FILE}
 
-	collect_response "Enter the SSID for your workplace" "clear-corporate"
-	printf "WORK_SSID=\"$response\"\n" >> $CONFIG_FILE
+    collect_response "Enter the SSID for your home" "home-ssid"
+    printf "HOME_SSID=\"${response}\"\n" >> ${CONFIG_FILE}
 
-	collect_response "Enter the SSID for your home" "You kids get off my LAN"
-	printf "HOME_SSID=\"$response\"\n" >> $CONFIG_FILE
+    collect_response "Enter the domain suffix pattern for your home" "local"
+    printf "HOME_DOMAIN_PATTERN=\"${response}\"\n" >> ${CONFIG_FILE}
 
-	collect_response "Enter the domain suffix pattern for your home" "local"
-	printf "HOME_DOMAIN_PATTERN=\"$response\"\n" >> $CONFIG_FILE
-fi
+    # Collect NTP server settings for work and home
+    collect_response "Enter the NTP server for your workplace" "time.workplace.com"
+    printf "WORK_NTP_SERVER=\"${response}\"\n" >> ${CONFIG_FILE}
 
-cat $(dirname $0)/Library/LaunchAgents/local.netwatcher.plist_template | sed "s/USERX/$USER/g" > $(dirname $0)/Library/LaunchAgents/local.netwatcher.plist
-cp -r $(dirname $0)/Library ~/
+    collect_response "Enter the NTP server for your home" "time.apple.com"
+    printf "HOME_NTP_SERVER=\"${response}\"\n" >> ${CONFIG_FILE}
+  fi
 
-[[ $throttle == true ]] && throttle_options="-t$throttle_time"
-[[ $pause_to_settle == true ]] && pause_options="-p$pause_time"
+  # Set throttle and pause options if specified
+  [[ ${throttle} == "true" ]] && throttle_options="-t${throttle_time}"
+  [[ ${pause_to_settle} == "true" ]] && pause_options="-p${pause_time}"
 
-args=("$throttle_options" "$pause_options")
-for (( i=0; i<${#args[@]}; i++ )); do
-   if (( ${#args[i]} == 0 )); then
-	  unset args[i]
-   fi
-done
+  # Prepare arguments for the LaunchAgent
+  args=("${throttle_options}" "${pause_options}")
+  for (( i=0; i<${#args[@]}; i++ )); do
+    if (( ${#args[i]} == 0 )); then
+      unset args[i]
+    fi
+  done
 
-if [[ $throttle == true ]] || [[ $pause_to_settle == true ]]; then
-	printf "Setting options to: $throttle_options $pause_options\n"
-	defaults write ${HOME}/Library/LaunchAgents/local.netwatcher.plist \
-		 ProgramArguments \
-		 -array "${HOME}/Library/Scripts/netwatcher" ${args[@]}
-	plutil -convert xml1 ~/Library/LaunchAgents/local.netwatcher.plist
-fi
+  # Update the LaunchAgent plist
+  printf "Configuring LaunchAgent\n"
+  if [[ ${throttle} == "true" ]] || [[ ${pause_to_settle} == "true" ]]; then
+    if ! defaults write ${HOME}/Library/LaunchAgents/local.netwatcher.plist \
+      ProgramArguments \
+      -array "${HOME}/Library/Scripts/netwatcher" ${args[@]}; then
+      printf "Error: Failed to write plist options\n"
+      exit 1
+    fi
+  else
+    if ! defaults write ${HOME}/Library/LaunchAgents/local.netwatcher.plist \
+      ProgramArguments \
+      -array "${HOME}/Library/Scripts/netwatcher"; then
+      printf "Error: Failed to write plist options\n"
+      exit 1
+    fi
+  fi
+  if ! plutil -convert xml1 ~/Library/LaunchAgents/local.netwatcher.plist; then
+    printf "Error: Failed to convert plist to XML\n"
+    exit 1
+  fi
 
-launchctl load ~/Library/LaunchAgents/local.netwatcher.plist
+  # Load the LaunchAgent
+  if ! launchctl load ~/Library/LaunchAgents/local.netwatcher.plist; then
+    printf "Error: Failed to load LaunchAgent\n"
+    exit 1
+  fi
 
-printf "Installation complete\n"
-printf "Use \"defaults read ~/Library/LaunchAgents/local.netwatcher.plist\" to see default plist values\n"
-printf "Use \"defaults write ~/Library/LaunchAgents/local.netwatcher.plist <key> <value>\" to change plist values\n"
-printf "Do \"sudo touch /var/run/resolv.conf\" to test\n"
+  # Print completion messages
+  printf "Installation complete\n"
+  printf "Use \"defaults read ~/Library/LaunchAgents/local.netwatcher.plist\" to see default plist values\n"
+  printf "Use \"defaults write ~/Library/LaunchAgents/local.netwatcher.plist <key> <value>\" to change plist values\n"
+  printf "Do \"sudo touch /var/run/resolv.conf\" to test\n"
 
-exit 0
+  exit 0
+}
+
+# Call the main function
+main "$@"

@@ -3,7 +3,7 @@
 # exit if script tries to use undeclared variables.
 set -u
 
-# Requires Bash 4+ for associative arrays. If using macOS default bash (3.2), this won't work.
+# Requires Bash 4+ for associative arrays and named references.
 # Install a newer bash via Homebrew and run this script with /opt/homebrew/bin/bash.
 #
 # Update PATH so we can rely on executables without full paths
@@ -15,7 +15,7 @@ export PATH=/bin:/usr/bin:/sbin:/usr/sbin:/opt/homebrew/bin:/usr/local/bin
 #
 #    DESCRIPTION
 #      This script is executed by the local.netwatcher LaunchAgent whenever
-#      /etc/resolv.conf changes. Its purpose is to determine if the network
+#      /var/run/resolv.conf changes. Its purpose is to determine if the network
 #      environment has changed to or from a corporate (work) network, a home
 #      network, or a VPN. It then configures system settings (proxies, printers,
 #      NTP, etc.) based on the detected environment.
@@ -597,7 +597,7 @@ main() {
 
     log_msg ""
     log_msg "$(print_dashes 20) $(date '+%b %d %H:%M:%S') $(print_dashes 21)"
-    log_msg "Change to /etc/resolv.conf detected"
+    log_msg "Change to resolv.conf detected"
 
     # If we ran too recently (within THROTTLE seconds), exit to prevent rapid-fire triggers.
     if [[ -f "${LAST_NETWORK_MARKER}" ]]; then
@@ -704,7 +704,7 @@ main() {
     # If VPN is connected, VPN trumps all. Decide work or home based on domain pattern.
     if [[ -n ${vpn_ip_address} ]]; then
         if [[ ${vpn_ip_address} =~ [1-9] ]]; then
-            if grep -qs "${WORK_DOMAIN_PATTERN}" /etc/resolv.conf ; then
+            if grep -qs "${WORK_DOMAIN_PATTERN}" /var/run/resolv.conf ; then
                 switch_location "work" "${vpn_ip_address}"
             else
                 switch_location "home" "${vpn_ip_address}"
