@@ -82,6 +82,9 @@ declare -A vpn_clients=(
     ["AWS VPN Client"]="/Applications/AWS VPN Client.app"
 )
 
+# Proxy server for work location
+declare proxy="http://proxy.company.com:8080"
+
 #-------------------------------------------------------------------------------
 # Logging function
 # ARGUMENTS:
@@ -156,8 +159,7 @@ check_sudo_access() {
         return 0
     fi
 
-    # Only essential commands remain after removing DNS code
-    local commands=(/usr/sbin/networksetup /usr/sbin/sntp /usr/sbin/systemsetup /usr/bin/killall)
+    local commands=(/bin/mkdir /usr/bin/tee /usr/sbin/networksetup /usr/sbin/sntp /usr/sbin/systemsetup /usr/bin/killall)
 
     for cmd in "${commands[@]}"; do
         if ! grep -qs "NOPASSWD: ${cmd}" "${sudo_check_file}"; then
@@ -354,43 +356,75 @@ turn_off_airport() {
 }
 
 #-------------------------------------------------------------------------------
-# enable_proxy
+# set_dns_search_suffixes
 # DESCRIPTION:
-#   Sets up WPAD-based automatic proxies for Wi-Fi and Ethernet.
-#   Useful when on corporate networks requiring proxy configs.
-enable_proxy() {
-    local service
-    local IFS="$(printf "\n\b")"
+#   Adds DNS search suffixes when on VPN - replace with actual domains as needed.
+#   This is useful for resolving internal hostnames without needing to specify the full domain.
+#   Requires passwordless sudo access for /bin/mkdir and /usr/bin/tee.
+set_dns_search_suffixes() {
+    if check_sudo_access; then
+        # Make sure resolver dir exists
+        sudo mkdir -p /etc/resolver
 
-    if ! networksetup -listnetworkserviceorder > /dev/null 2>&1; then
-        log_msg "ERROR: Failed to list network services"
-        return 1
+        # Define the resolver file path
+        local resolver_file="/etc/resolver/vpn"
+
+        # Define the search domains to be added
+        local search_domains=(
+            .lan .home.arpa
+        )
+
+        echo -e "search ${search_domains[*]}" | sudo tee "${resolver_file}" > /dev/null 2>&1
+        sudo chmod 644 "${resolver_file}" 2>/dev/null
     fi
-
-    for service in $(networksetup -listnetworkserviceorder | \
-                     awk '/\([0-9]\).*Wi-Fi/ || /\([0-9]\).*Ethernet/{ print }' | \
-                     sed 's/([0-9]) //'); do
-        networksetup -setautoproxyurl "${service}" "http://wpad/wpad.dat"
-        networksetup -setautoproxystate "${service}" on
-    done
-    unset IFS
-    log_msg "WPAD Automatic Proxy URL: enabled"
 }
 
 #-------------------------------------------------------------------------------
-# disable_proxy
+# unset_dns_search_suffixes
 # DESCRIPTION:
-#   Disables WPAD-based proxies. Useful when switching to a home network not requiring them.
-disable_proxy() {
+#   Removes DNS search suffixes for OCI when not on VPN
+unset_dns_search_suffixes() {
+    if check_sudo_access; then
+
+        # Define the resolver file path
+        local resolver_file="/etc/resolver/vpn"
+
+        [[ -f "${resolver_file}" ]] && sudo rm -f "${resolver_file}" 2>/dev/null
+    fi
+}
+
+
+#-------------------------------------------------------------------------------
+# set_proxy_state
+# DESCRIPTION:
+#   Sets/Unsets WPAD-based automatic proxies for connected services (thost that have IPv4 address).
+#   Useful when on corporate networks requiring proxy configs.
+set_proxy_state() {
+    local action="${1,,}"
     local service
-    local IFS="$(printf "\n\b")"
-    for service in $(networksetup -listnetworkserviceorder | \
-                     awk '/\([0-9]\).*Wi-Fi/ || /\([0-9]\).*Ethernet/{ print }' | \
-                     sed 's/([0-9]) //'); do
-        networksetup -setautoproxystate "${service}" off
-    done
-    unset IFS
-    log_msg "WPAD Automatic Proxy URL: disabled"
+    local services
+
+    # Get the list of network services (omit the header)
+    services=$(networksetup -listallnetworkservices | tail -n +2)
+
+    while IFS= read -r service; do
+        # Extract only the first "IP address:" value
+        ip=$(networksetup -getinfo "$service" | grep '^IP address:' | head -n1 | awk -F': ' '{print $2}' | xargs)
+
+        # Check if the extracted value is a valid IPv4 address
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # log_msg "$service IP: $ip"
+            # Set or unset the auto proxy URL and enable the proxy for the connected service.
+            if [[ ${action} == on ]]; then
+                log_msg "Enabling automatic proxy for: $service"
+                networksetup -setautoproxyurl "$service" "http://wpad/wpad.dat"
+                networksetup -setautoproxystate "$service" on
+            else
+                log_msg "Disabling automatic proxy for: $service"
+                networksetup -setautoproxystate "$service" off
+            fi
+        fi
+    done <<< "$services"
 }
 
 #-------------------------------------------------------------------------------
@@ -495,30 +529,46 @@ set_default_printer() {
 #   Ensures correct time sync based on location.
 set_ntp_server() {
     local ntp_server="$1"
-    local user_id
-    user_id="$(id -un)"
-    local sudo_check_file
-    sudo_check_file="$(mktemp -t "${user_id}.xxxx")"
-    local nopasswd_all=1
-    local nopasswd_systemsetup=1
-
-    sudo -ln > "${sudo_check_file}" 2>&1
-
-    grep -sqi 'NOPASSWD.*ALL' "${sudo_check_file}" 2>/dev/null
-    nopasswd_all=$?
-
-    grep -sqi 'NOPASSWD.*systemsetup' "${sudo_check_file}" 2>/dev/null
-    nopasswd_systemsetup=$?
-
-    if ((nopasswd_all == 0 || nopasswd_systemsetup == 0)); then
+    if check_sudo_access; then
         sudo systemsetup -setnetworktimeserver "${ntp_server}" >/dev/null 2>&1
         log_msg "Setting time source to: ${ntp_server}"
         sudo sntp -sS "${ntp_server}" > /dev/null 2>&1
     else
+        local user_id
+        user_id="$(id -un)"
         log_msg "${user_id} does not have passwordless sudo access. Time source cannot be changed."
     fi
+}
 
-    rm -f "${sudo_check_file}"
+#-------------------------------------------------------------------------------
+# get_connection_info
+# ARGUMENTS:
+# $1 : "work" or "home" (optional proxy configuration)
+# DESCRIPTION:
+# Retrieves public IP and geolocation data from ip-api.com, optionally using a proxy server when at work.
+# Returns a JSON string containing WAN information, including IP address, country, region, city, and more.
+get_connection_info() {
+    local location="$1"
+    local address="${2:-null}"
+    local api="http://ip-api.com/json"
+    local curl="curl --connect-timeout 3 -s"
+    if [[ ${location} == work ]]; then
+        curl+=" -x ${proxy}"
+    else
+        curl+=" --noproxy '*'"
+    fi
+
+    [[ ${address} != null ]] && api+="/${address}"
+
+    # Retrieve public IP and geolocation data from ip-api.com
+    local response=$(${curl} "${api}")
+
+    # Check for a successful response
+    if [[ $(echo "${response}" | jq -r '.status') != "success" ]]; then
+        return 1
+    fi
+
+    echo "${response}"
 }
 
 #-------------------------------------------------------------------------------
@@ -533,13 +583,18 @@ set_ntp_server() {
 switch_location() {
     local location="$1"
     local ip_address="$2"
+    local notify_msg="Local IP: ${ip_address}"
+    local connection_info=""
+    local isp=""
 
     if [[ ${location} == work ]]; then
-        notify "Location: Work" "IP: ${ip_address}"
+        local vpn_ip
+        local vpn_proto
 
-        enable_proxy
+        set_proxy_state on
         set_ntp_server "${WORK_NTP_SERVER:-10.75.20.11}"
         set_default_printer "${WORK_PRINTER}"
+        set_dns_search_suffixes
 
         # Wait a bit to ensure network changes settle before querying VPN stats.
         sleep 3
@@ -554,20 +609,17 @@ switch_location() {
                 i=$(( i + 1 ))
             done
             if (( ${#vpn_stats[@]} > 0 )); then
-                local vpn_server
-                local vpn_proto
-                vpn_server=$(dig -x "${vpn_stats[0]}" +short 2>/dev/null | sed s/\.$//)
+                vpn_ip="${vpn_stats[0]}"
                 vpn_proto=${vpn_stats[1]}
-                [[ -n ${vpn_server} ]] && log_msg "VPN Server: ${vpn_server}"
-                [[ -n ${vpn_proto} ]] && log_msg "VPN Protocol: ${vpn_proto}"
+                connection_info=$(get_connection_info "${location}" "${vpn_ip}")
+                [[ -n ${vpn_proto} ]] && notify_msg+=$'\n'"VPN Protocol: ${vpn_proto}"
             fi
         fi
     else
-        notify "Location: Home" "IP: ${ip_address}"
-
-        disable_proxy
+        set_proxy_state off
         set_ntp_server "${HOME_NTP_SERVER:-time.apple.com}"
         set_default_printer "${HOME_PRINTER}"
+        unset_dns_search_suffixes
 
         # Quit VPN clients at home to prevent conflicts or unnecessary tunneling.
         local client_name
@@ -576,6 +628,25 @@ switch_location() {
                 quit_program "${client_name}"
             fi
         done
+    fi
+
+    # This was already run if we got a VPN endpoint address above
+    [[ -n ${connection_info} ]] || connection_info=$(get_connection_info "${location}")
+
+    if [[ -n ${connection_info} ]]; then
+        local fields=(region city)
+        for field in "${fields[@]}"; do
+            local value=$(echo "${connection_info}" | jq -r ".${field}")
+            [[ -n ${value} ]] && notify_msg+=$'\n'"${field^}: ${value}"
+        done
+
+        isp=$(echo "${connection_info}" | jq -r ".isp")
+    fi
+
+    if [[ -n ${isp} ]]; then
+        notify "${isp}" "${notify_msg}"
+    else
+        notify "Connection: ${location}" "${notify_msg}"
     fi
 }
 
