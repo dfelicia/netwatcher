@@ -70,7 +70,7 @@ THROTTLE=5
 # List of common VPN clients. When switching to home, we try to quit these.
 # Associative arrays require Bash 4+.
 declare -A vpn_clients=(
-    ["Cisco AnyConnect Secure Mobility Client"]="/Applications/Cisco/Cisco AnyConnect Secure Mobility Client.app"
+    ["Cisco Secure Client"]="/Applications/Cisco/Cisco Secure Client.app"
     ["OpenVPN"]="/usr/local/bin/openvpn"
     ["Shimo"]="/Applications/Shimo.app"
     ["FortiClient"]="/Applications/FortiClient.app"
@@ -81,9 +81,6 @@ declare -A vpn_clients=(
     ["Sophos Connect"]="/Applications/Sophos Connect.app"
     ["AWS VPN Client"]="/Applications/AWS VPN Client.app"
 )
-
-# Proxy server for work location
-declare proxy="http://proxy.company.com:8080"
 
 #-------------------------------------------------------------------------------
 # Logging function
@@ -159,7 +156,8 @@ check_sudo_access() {
         return 0
     fi
 
-    local commands=(/bin/mkdir /usr/bin/tee /usr/sbin/networksetup /usr/sbin/sntp /usr/sbin/systemsetup /usr/bin/killall)
+    # Only essential commands remain after removing DNS code
+    local commands=(/bin/mkdir /usr/sbin/networksetup /usr/sbin/sntp /usr/sbin/systemsetup /usr/bin/killall /usr/bin/pkill)
 
     for cmd in "${commands[@]}"; do
         if ! grep -qs "NOPASSWD: ${cmd}" "${sudo_check_file}"; then
@@ -303,6 +301,7 @@ parse_interfaces() {
 #   Logs title and message, and if terminal-notifier is available and allowed,
 #   sends a macOS notification. Useful for immediate feedback when networks change.
 notify() {
+    #set -v -x -e
     local title="$1"
     local message="$2"
 
@@ -320,6 +319,7 @@ notify() {
             -open "file:///${HOME}/Library/Logs/netwatcher.log" > /dev/null 2>&1 || \
             log_msg "Failed to send notification"
     fi
+    #set +v +x +e
 }
 
 #-------------------------------------------------------------------------------
@@ -358,9 +358,7 @@ turn_off_airport() {
 #-------------------------------------------------------------------------------
 # set_dns_search_suffixes
 # DESCRIPTION:
-#   Adds DNS search suffixes when on VPN - replace with actual domains as needed.
-#   This is useful for resolving internal hostnames without needing to specify the full domain.
-#   Requires passwordless sudo access for /bin/mkdir and /usr/bin/tee.
+#   Adds DNS search suffixes for OCI when on VPN
 set_dns_search_suffixes() {
     if check_sudo_access; then
         # Make sure resolver dir exists
@@ -371,7 +369,15 @@ set_dns_search_suffixes() {
 
         # Define the search domains to be added
         local search_domains=(
-            .lan .home.arpa
+            us.oracle.com oracle.com appoci.oraclecorp.com
+            appsdev.fusionappsdphx1.oraclevcn.com appsdev0.fusionappsdphx1.oraclevcn.com
+            appsdev1.fusionappsdphx1.oraclevcn.com ad1.fusionappsdphx1.oraclevcn.com
+            ad2.fusionappsdphx1.oraclevcn.com ad3.fusionappsdphx1.oraclevcn.com
+            bomsubnet1.fusionappsdbom1.oraclevcn.com bom2.fusionappsdbom1.oraclevcn.com
+            lhr.fusionapps02lhr.oraclevcn.com oci.appsdev.oraclevcn.com
+            ad1.fusionappsdephx.oraclevcn.com ad2.fusionappsdephx.oraclevcn.com
+            ad3.fusionappsdephx.oraclevcn.com dnssubnetad1.fadevtest01phx.oraclevcn.com
+            reg2.fadevtest01phx.oraclevcn.com
         )
 
         echo -e "search ${search_domains[*]}" | sudo tee "${resolver_file}" > /dev/null 2>&1
@@ -397,7 +403,7 @@ unset_dns_search_suffixes() {
 #-------------------------------------------------------------------------------
 # set_proxy_state
 # DESCRIPTION:
-#   Sets/Unsets WPAD-based automatic proxies for connected services (thost that have IPv4 address).
+#   Sets/Unsets WPAD-based automatic proxies for connected services (those that have IPv4 address).
 #   Useful when on corporate networks requiring proxy configs.
 set_proxy_state() {
     local action="${1,,}"
@@ -553,6 +559,7 @@ get_connection_info() {
     local api="http://ip-api.com/json"
     local curl="curl --connect-timeout 3 -s"
     if [[ ${location} == work ]]; then
+        local proxy="http://www-proxy-hqdc.us.oracle.com:80"
         curl+=" -x ${proxy}"
     else
         curl+=" --noproxy '*'"
@@ -628,6 +635,8 @@ switch_location() {
                 quit_program "${client_name}"
             fi
         done
+        # ciscod has a memory leak :-/
+        check_sudo_access && sudo pkill -f ciscod > /dev/null 2>&1
     fi
 
     # This was already run if we got a VPN endpoint address above
