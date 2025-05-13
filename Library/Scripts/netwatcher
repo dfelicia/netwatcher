@@ -42,10 +42,18 @@ export PATH=/bin:/usr/bin:/sbin:/usr/sbin:/opt/homebrew/bin:/usr/local/bin
 #
 #    SUDOERS EXAMPLES
 #      The script requires passwordless sudo access for certain commands:
-#        %admin ALL=(ALL) NOPASSWD: /usr/sbin/networksetup, /usr/sbin/sntp, \
-#        /usr/sbin/systemsetup, /usr/bin/killall
+#        %admin ALL=(ALL) NOPASSWD: /bin/mkdir, /usr/bin/tee, /bin/chmod, /bin/rm, \
+#        /usr/sbin/networksetup, /usr/sbin/sntp, /usr/sbin/systemsetup, \
+#        /usr/bin/killall, /usr/bin/pkill
 #
-#      Adjust the group (%admin) and user as needed. By allowing these commands without
+#      To add these commands to the sudoers file, run:
+#        sudo visudo
+#      and add the following lines:
+#        %admin ALL=(ALL) NOPASSWD: /bin/mkdir, /usr/bin/tee, /bin/chmod, /bin/rm, \
+#        /usr/sbin/networksetup, /usr/sbin/sntp, /usr/sbin/systemsetup, \
+#        /usr/bin/killall, /usr/bin/pkill
+#
+#      Adjust the group (%admin) as needed. By allowing these commands without
 #      a password prompt, the script can make changes quietly and automatically.
 #
 #    NOTIFICATION CENTER INTEGRATION
@@ -157,7 +165,7 @@ check_sudo_access() {
     fi
 
     # Only essential commands remain after removing DNS code
-    local commands=(/bin/mkdir /usr/sbin/networksetup /usr/sbin/sntp /usr/sbin/systemsetup /usr/bin/killall /usr/bin/pkill)
+    local commands=(/bin/mkdir /usr/bin/tee /bin/chmod /bin/rm /usr/sbin/networksetup /usr/sbin/sntp /usr/sbin/systemsetup /usr/bin/killall /usr/bin/pkill)
 
     for cmd in "${commands[@]}"; do
         if ! grep -qs "NOPASSWD: ${cmd}" "${sudo_check_file}"; then
