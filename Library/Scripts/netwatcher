@@ -414,10 +414,8 @@ set_proxy_state() {
 
         if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             if [[ "$action" == "on" ]]; then
-                log_msg "Enabling automatic proxy for: $service"
                 if parse_wpad_proxy; then
-                    # WPAD fetched (proxy may be set or empty)
-                    log_msg "Using WPAD URL for system auto-proxy: ${WPAD_DAT_URL}"
+                    log_msg "Enabling automatic proxy (${WPAD_DAT_URL}) for: $service"
                     networksetup -setautoproxyurl "$service" "${WPAD_DAT_URL}"
                     networksetup -setautoproxystate "$service" on
                 else
