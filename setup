@@ -1,0 +1,529 @@
+#!/bin/bash
+
+# setup: Installer and configuration script for netwatcher
+# Description:
+#   Performs initial setup of netwatcher:
+#     - Verifies environment (non-root, dependencies, Bash version)
+#     - Copies scripts, creates configuration, and installs LaunchAgent
+# Usage:
+#   setup [-u] [-r] [-t secs] [-p secs]
+#
+# Options:
+#   -u    Stop and uninstall netwatcher
+#   -r    Reinstall (rerun setup questions)
+#   -t    Throttle interval (seconds) between network-change events
+#   -p    Pause interval (seconds) before evaluating a change
+#
+
+IFS=$'\n\t'
+
+# Function: error_handler
+# Description: Handles errors by reporting the failed command, exit code, and line number
+error_handler() {
+    local exit_code=$1
+    local line_no=$2
+    local cmd=$3
+    printf "ERROR: Command '%s' exited with code %d at line %d\n" "$cmd" "$exit_code" "$line_no"
+    uninstall
+}
+# Ensure ERR trap is inherited in functions and subshells
+set -o errtrace
+# Ensure pipelines trigger ERR
+set -o pipefail
+# Trap any command that exits with non-zero status
+
+# Trap Ctrl-C (SIGINT) to run uninstall
+trap 'uninstall' SIGINT
+trap 'error_handler $? ${LINENO} "$BASH_COMMAND"' ERR
+
+# Constants
+declare -r config_dir="${HOME}/.netwatcher"
+declare -r config_file="${config_dir}/config"
+declare -r netwatcher_script="${HOME}/Library/Scripts/netwatcher"
+
+# Function: ask
+# Prompts the user for a yes/no answer until valid input is given.
+# Globals:
+#   answer  - set to 'y' or 'n'
+# Arguments:
+#   None
+# Returns:
+#   None
+ask() {
+    local reply
+    local done="false"
+    while [[ ${done} == "false" ]]; do
+        printf " (y/n) "
+        read -r reply
+        done="true"
+        case ${reply} in
+            n | N | no | NO) answer="n" ;;
+            y | Y | yes | YES) answer="y" ;;
+            *)
+                printf "Invalid response. Try again:"
+                done="false"
+                ;;
+        esac
+    done
+}
+
+# Function: collect_response
+# Collects a response from the user with a default value and trims whitespace.
+# Globals:
+#   None
+# Arguments:
+#   $1 - question prompt
+#   $2 - default value
+# Returns:
+#   None
+collect_response() {
+    local question default
+    question="$1"
+    default="$2"
+    printf "%s\n" "${question}"
+    printf "[ Enter = \"%s\" ]: " "${default}"
+    read -r response
+    # Trim leading/trailing whitespace
+    response="${response#"${response%%[![:space:]]*}"}"
+    response="${response%"${response##*[![:space:]]}"}"
+    # Normalize response to lowercase (POSIX-compatible)
+    response="$(printf '%s' "$response" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "${response}" ]]; then
+        response="${default}"
+    fi
+}
+
+# Function: uninstall
+# Uninstalls netwatcher by unloading LaunchAgent and removing files.
+# Globals:
+#   config_dir
+# Arguments:
+#   None
+# Returns:
+#   Exits script with code 0
+uninstall() {
+    launchctl unload \
+        ~/Library/LaunchAgents/local.netwatcher.plist >/dev/null 2>&1
+    rm -f ~/Library/Scripts/netwatcher
+    rm -f ~/Library/LaunchAgents/local.netwatcher.plist
+    rm -f ~/Library/LaunchAgents/local.netwatcher
+    rm -f ~/Library/Logs/netwatcher.log
+    rm -rf "${config_dir}"
+    printf "Uninstall complete\n"
+    exit 0
+}
+
+# Function: usage
+# Displays usage information for the setup script.
+# Globals:
+#   None
+# Arguments:
+#   None
+# Returns:
+#   Exits script with code 0
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [-u] [-r] [-t secs] [-p secs]
+       -u Stop and uninstall
+       -r Reinstall (re-ask setup questions)
+       -t Time (in seconds) that must pass between network changes for them to be considered valid
+       -p Time (in seconds) to pause before evaluating a network change to allow interfaces to settle
+
+Example: $0 -t 5 -p 3
+
+EOF
+    exit 0
+}
+
+# Function: show_sudoers_info
+# Displays instructions and optional automated setup for passwordless sudo access.
+# Globals:
+#   None
+# Arguments:
+#   None
+# Returns:
+#   None
+show_sudoers_info() {
+    cat <<EOF
+The script requires passwordless sudo access for certain commands.
+For best security, restrict file operations to only /etc/resolver/vpn:
+
+  %admin ALL=(ALL) NOPASSWD: \\
+    /bin/mkdir /etc/resolver, \\
+    /usr/bin/tee, \\
+    /bin/chmod 644 /etc/resolver/vpn, \\
+    /bin/rm /etc/resolver/vpn, \\
+    /usr/sbin/networksetup, \\
+    /usr/sbin/sntp, \\
+    /usr/sbin/systemsetup, \\
+    /usr/bin/killall, \\
+    /usr/bin/pkill
+
+To add these commands to sudoers, we can create a file at /etc/sudoers.d/${USER}.
+Note: you will be prompted for your password to write this file.
+EOF
+}
+
+# Function: check_sudo_access
+# ARGUMENTS:
+#   None
+# DESCRIPTION:
+#   Ensures passwordless sudo for required commands. If not available, displays sudoers info.
+# Globals:
+#   None
+# Returns:
+#   0 if all required commands are configured for passwordless sudo, 1 otherwise
+check_sudo_access() {
+    local user_id sudoout
+    user_id="$(id -un)"
+    sudoout=$(sudo -ln 2>&1)
+
+    # Check for global NOPASSWD: ALL first
+    if [[ "$sudoout" == *"NOPASSWD: ALL"* ]]; then
+        return 0
+    fi
+
+    # Only essential commands remain
+    local commands=(/bin/mkdir /usr/bin/tee /bin/chmod /bin/rm /usr/sbin/networksetup /usr/sbin/sntp /usr/sbin/systemsetup /usr/bin/killall /usr/bin/pkill)
+    for cmd in "${commands[@]}"; do
+        if [[ "$sudoout" != *"${cmd}"* ]]; then
+            show_sudoers_info
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# Function: configure_sudoers
+# DESCRIPTION:
+#   If passwordless sudo is not configured, prompts the user and sets up a sudoers file.
+# Globals:
+#   None
+# Arguments:
+#   None
+# Returns:
+#   None
+configure_sudoers() {
+    local user_id
+    user_id="$(id -un)"
+    if ! check_sudo_access; then
+        collect_response "Do you want to configure passwordless sudo now? (y/n)" "n"
+        if [[ "${response}" == "y" ]]; then
+            printf "Configuring sudoers file (you may be prompted for your password)\n"
+            # Use default sudoers.d directory
+            local sudoers_dir="/etc/sudoers.d"
+            local sudoers_file="${sudoers_dir}/${user_id}"
+            # (User should manually ensure includedir is active in /etc/sudoers)
+            printf "Note: Please ensure '/etc/sudoers' has an uncommented 'includedir /etc/sudoers.d' line (use 'sudo visudo')\n"
+            if [[ -f "${sudoers_file}" ]]; then
+                printf "Appending to existing %s\n" "${sudoers_file}"
+                sudo tee -a "${sudoers_file}" >/dev/null <<EOF
+# netwatcher sudoers entry for ${user_id}
+%admin ALL=(ALL) NOPASSWD: /bin/mkdir /etc/resolver, \
+/usr/bin/tee, \
+/bin/chmod 644 /etc/resolver/vpn, \
+/bin/rm /etc/resolver/vpn, \
+/usr/sbin/networksetup, /usr/sbin/sntp, /usr/sbin/systemsetup, \
+/usr/bin/killall, /usr/bin/pkill
+EOF
+            else
+                printf "Creating new %s\n" "${sudoers_file}"
+                sudo tee "${sudoers_file}" >/dev/null <<EOF
+# netwatcher sudoers entry for ${user_id}
+%admin ALL=(ALL) NOPASSWD: /bin/mkdir /etc/resolver, \
+/usr/bin/tee, \
+/bin/chmod 644 /etc/resolver/vpn, \
+/bin/rm /etc/resolver/vpn, \
+/usr/sbin/networksetup, /usr/sbin/sntp, /usr/sbin/systemsetup, \
+/usr/bin/killall, /usr/bin/pkill
+EOF
+            fi
+            sudo chmod 440 "${sudoers_file}"
+            printf "Sudoers file configured\n"
+        fi
+    fi
+}
+
+# Function: update_shebang
+# Updates the shebang line in the netwatcher script to the specified bash path.
+# Globals:
+#   netwatcher_script
+# Arguments:
+#   $1 - path to bash executable
+# Returns:
+#   None
+update_shebang() {
+    local bash_path="$1"
+    sed -i '' "1s|#!.*|#!${bash_path}|" "${netwatcher_script}"
+    printf "Updated shebang line in %s to #!%s\n" "${netwatcher_script}" "${bash_path}"
+}
+
+#-------------------------------------------------------------------------------
+# Function: check_dependencies
+# DESCRIPTION:
+#   Verifies that required tools and Bash version are available.
+# Globals:
+#   None
+# Arguments:
+#   None
+# Returns:
+#   Exits script with code 1 if dependencies are missing or conditions not met
+check_dependencies() {
+    # Check if running as root
+    if ((EUID == 0)); then
+        printf "This script should not be run as root\n"
+        exit 1
+    fi
+
+    # Check macOS version (require 10.14 or newer)
+    local os_version
+    os_version=$(sw_vers -productVersion)
+    IFS='.' read -r os_major os_minor _ <<<"${os_version}"
+    if ((os_major < 10)) || { ((os_major == 10)) && ((os_minor < 14)); }; then
+        printf "ERROR: macOS 10.14 or newer is required (current: %s)\n" "${os_version}"
+        exit 1
+    fi
+
+    # Check for required binaries
+    local deps=(jq curl gsed)
+    local missing=()
+    for dep in "${deps[@]}"; do
+        if ! command -v "${dep}" >/dev/null 2>&1; then
+            missing+=("${dep}")
+        fi
+    done
+    if ((${#missing[@]} > 0)); then
+        if command -v brew >/dev/null 2>&1; then
+            printf "ERROR: Missing dependencies: %s\n" "${missing[*]}"
+            printf "You can install them with Homebrew:\n"
+            printf "  brew install %s\n" "${missing[*]}"
+        else
+            printf "ERROR: Missing dependencies: %s\n" "${missing[*]}"
+            printf "Please install %s and rerun this script\n" "${missing[*]}"
+        fi
+        exit 1
+    fi
+
+    # Optional dependency for Notification Center alerts
+    if ! command -v terminal-notifier >/dev/null 2>&1; then
+        printf "Warning: Optional 'terminal-notifier' not found; Notification Center alerts will be disabled\n"
+    fi
+
+    # Select default bash path based on CPU architecture
+    local arch
+    arch=$(uname -m)
+    local bash_candidate
+    if [[ "${arch}" == "x86_64" ]]; then
+        bash_candidate="/usr/local/bin/bash"
+    else
+        bash_candidate="/opt/homebrew/bin/bash"
+    fi
+    while true; do
+        if [[ -x "${bash_candidate}" ]]; then
+            local version=$("${bash_candidate}" --version | head -n 1 | awk '{print $4}')
+            if [[ "${version}" =~ ^[45] ]]; then
+                break
+            else
+                printf "Bash version at %s is not 4.x or higher.\n" "${bash_candidate}"
+            fi
+        else
+            printf "Bash not found at %s.\n" "${bash_candidate}"
+        fi
+        printf "Please provide the full path to a bash version 4.x or higher: "
+        read -r bash_candidate
+    done
+    # Save chosen bash for later shebang update
+    default_bash="${bash_candidate}"
+}
+
+# Function: main
+# Entry point: orchestrates dependency checks, option parsing, install/uninstall logic, and LaunchAgent setup.
+# Globals:
+#   reinstall uninstall throttle pause_to_settle throttle_time pause_time config_dir config_file netwatcher_script
+# Arguments:
+#   All script arguments ($@)
+# Returns:
+#   Exit code 0 on success, >0 on failure
+main() {
+    # Initialize flags to avoid unbound-variable errors
+
+    local OPTIND=1
+
+    while getopts ":urt:p:" OPTION; do
+        case ${OPTION} in
+            u) uninstall="true" ;;
+            r) reinstall="true" ;;
+            t)
+                throttle="true"
+                throttle_time=${OPTARG}
+                ;;
+            p)
+                pause_to_settle="true"
+                pause_time=${OPTARG}
+                ;;
+            ?) usage ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # Uninstall if the uninstall flag is set
+    [[ "${uninstall}" == "true" ]] && uninstall
+
+    # Reinstall if the reinstall flag is set
+    [[ "${reinstall}" == "true" ]] && rm -f "${config_file}"
+
+    # Default throttle and pause intervals
+    throttle="true"
+    throttle_time="${throttle_time:-5}"
+    pause_to_settle="true"
+    pause_time="${pause_time:-5}"
+
+    check_dependencies
+    configure_sudoers
+
+    # Stop existing install
+    launchctl unload \
+        ~/Library/LaunchAgents/local.netwatcher.plist >/dev/null 2>&1 || {
+        printf "Error: Failed to unload LaunchAgent\n"
+        exit 1
+    }
+
+    # Create the LaunchAgent plist file from the template
+    cat "$(dirname "$0")/Library/LaunchAgents/local.netwatcher.plist_template" | sed "s|USERX|${USER}|g" >"$(dirname "$0")/Library/LaunchAgents/local.netwatcher.plist" || {
+        printf "Error: Failed to create LaunchAgent plist from template\n"
+        exit 1
+    }
+    cp -r "$(dirname "$0")/Library" ~/ || {
+        printf "Error: Failed to copy Library files\n"
+        exit 1
+    }
+
+    # Ensure netwatcher script is copied to the correct location and is executable
+    if [[ ! -f "${netwatcher_script}" ]]; then
+        cp "$(dirname "$0")/Scripts/netwatcher" "${netwatcher_script}" || {
+            printf "Error: Failed to copy netwatcher script\n"
+            exit 1
+        }
+        chmod +x "${netwatcher_script}" || {
+            printf "Error: Failed to make netwatcher script executable\n"
+            exit 1
+        }
+        # Update shebang now that script is present
+        update_shebang "${default_bash}"
+    fi
+
+    # Load previous settings if the config file exists
+    if [[ -r "${config_file}" ]]; then
+        source "${config_file}"
+        printf "Using existing %s\n" "${config_file}"
+
+    else
+        # Collect settings
+        mkdir -p "${config_dir}"
+        touch "${config_file}"
+        chmod 600 "${config_file}"
+
+        # List installed printers and collect work and home printer names
+        if ! lpstat -p >/dev/null 2>&1; then
+            printf "Warning: Unable to get printer list. Printer setup skipped.\n"
+            printf "WORK_PRINTER=\"none\"\n" >>"${config_file}"
+            printf "DEFAULT_PRINTER=\"none\"\n" >>"${config_file}"
+        else
+            printf "\nThe following printers are installed: "
+            printf "%s\n" "$(lpstat -p | awk '/^printer/ { print $2 }')"
+            default_printer=$(lpstat -d | awk '{ print $NF }')
+            collect_response "Enter the name of your work printer or \"none\" to disable this feature" "${default_printer}"
+            printf "WORK_PRINTER=\"%s\"\n" "${response}" >>"${config_file}"
+            collect_response "Enter the name of your default printer for non-work networks or \"none\" to disable this feature" "${default_printer}"
+            printf "DEFAULT_PRINTER=\"%s\"\n" "${response}" >>"${config_file}"
+        fi
+
+        # Check if terminal-notifier is installed
+        PATH=/opt/homebrew/bin:/usr/local/bin:${PATH}
+        if command -v terminal-notifier >/dev/null 2>&1; then
+            printf "Do you want to enable Notification Center alerts?"
+            ask
+            if [[ ${answer} == "y" ]]; then
+                printf "NOTIFICATION_CENTER=\"true\"\n" >>"${config_file}"
+            else
+                printf "NOTIFICATION_CENTER=\"false\"\n" >>"${config_file}"
+            fi
+        else
+            printf "terminal-notifier not found. Notification Center alerts disabled.\n"
+            printf "NOTIFICATION_CENTER=\"false\"\n" >>"${config_file}"
+        fi
+
+        collect_response "Enter the domain suffix pattern for your workplace" "example.com"
+        printf "WORK_DOMAIN_PATTERN=\"%s\"\n" "${response}" >>"${config_file}"
+
+        collect_response "Enter the SSID for your workplace" "corporate-ssid"
+        printf "WORK_SSID=\"%s\"\n" "${response}" >>"${config_file}"
+
+        # Collect NTP server settings for work and home
+        collect_response "Enter the NTP server for your workplace" "time.workplace.com"
+        printf "WORK_NTP_SERVER=\"%s\"\n" "${response}" >>"${config_file}"
+
+        collect_response "Enter the default NTP server for non-work networks" "time.apple.com"
+        printf "DEFAULT_NTP_SERVER=\"%s\"\n" "${response}" >>"${config_file}"
+
+        # Collect fallback proxy server host:port
+        collect_response "Enter the proxy server host:port for your workplace (or leave blank for none)" ""
+        printf "WORK_PROXY_SERVER=\"%s\"\n" "${response}" >>"${config_file}"
+
+        # Collect DNS search domains for VPN
+        collect_response "Enter extra DNS search domains for your workplace (or leave blank for none)" ""
+        printf "WORK_SEARCH_DOMAINS=\"%s\"\n" "${response}" >>"${config_file}"
+    fi
+
+    # Set throttle and pause options if specified
+    [[ "${throttle}" == "true" ]] && throttle_options="-t${throttle_time}"
+    [[ "${pause_to_settle}" == "true" ]] && pause_options="-p${pause_time}"
+
+    # Prepare arguments for the LaunchAgent
+    args=("${throttle_options}" "${pause_options}")
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        if ((${#args[i]} == 0)); then
+            unset args[i]
+        fi
+    done
+
+    # Update the LaunchAgent plist
+    printf "Configuring LaunchAgent\n"
+    if [[ "${throttle}" == "true" ]] || [[ "${pause_to_settle}" == "true" ]]; then
+        if ! defaults write "${HOME}/Library/LaunchAgents/local.netwatcher.plist" \
+            ProgramArguments \
+            -array "${HOME}/Library/Scripts/netwatcher" "${args[@]}"; then
+            printf "Error: Failed to write plist options\n"
+            exit 1
+        fi
+    else
+        if ! defaults write "${HOME}/Library/LaunchAgents/local.netwatcher.plist" \
+            ProgramArguments \
+            -array "${HOME}/Library/Scripts/netwatcher"; then
+            printf "Error: Failed to write plist options\n"
+            exit 1
+        fi
+    fi
+    if ! plutil -convert xml1 ~/Library/LaunchAgents/local.netwatcher.plist; then
+        printf "Error: Failed to convert plist to XML\n"
+        exit 1
+    fi
+
+    # Load the LaunchAgent
+    if ! launchctl load ~/Library/LaunchAgents/local.netwatcher.plist; then
+        printf "Error: Failed to load LaunchAgent\n"
+        exit 1
+    fi
+
+    # Print completion messages
+    printf "Installation complete\n"
+    printf "Use \"defaults read ~/Library/LaunchAgents/local.netwatcher.plist\" to see default plist values\n"
+    printf "Use \"defaults write ~/Library/LaunchAgents/local.netwatcher.plist <key> <value>\" to change plist values\n"
+    printf "Do \"sudo touch /var/run/resolv.conf\" to test\n"
+
+    exit 0
+}
+
+# Call the main function
+main "$@"
