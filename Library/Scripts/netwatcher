@@ -371,18 +371,23 @@ remove_work_dns_suffixes() {
 #-------------------------------------------------------------------------------
 # parse_wpad_proxy
 # DESCRIPTION:
-#   Downloads the WPAD file and extracts the proxy server. If successful,
-#   sets WORK_PROXY_SERVER to the parsed value.
+#   Fetches the WPAD file and extracts the proxy server. Returns 0 if fetch succeeded,
+#   1 on curl failure. Sets WORK_PROXY_SERVER if a proxy is parsed.
 parse_wpad_proxy() {
-    local proxy
+    local proxy curl_status
     proxy=$(curl --connect-timeout 3 --max-time 5 --noproxy '*' \
-        -s "${WPAD_DAT_URL}" 2>/dev/null |
-        grep -E 'proxies =' |
-        gsed "s|^\\s*proxies\\s*=\\s*\"PROXY\\s*\\([A-Za-z0-9\\.:/-]*\\);.*$|\\1|")
-    if [[ -n "${proxy}" ]]; then
-        WORK_PROXY_SERVER="${proxy}"
+        -s "${WPAD_DAT_URL}" 2>/dev/null)
+    curl_status=$?
+    if (( curl_status != 0 )); then
+        return 1
     fi
-    # printf '%s' "${proxy}"
+    # Attempt to extract a proxy URL
+    proxy=$(printf '%s' "$proxy" | grep -E 'proxies =' | \
+        gsed "s|^\\s*proxies\\s*=\\s*\"PROXY\\s*\\([A-Za-z0-9\\.:/-]*\\);.*$|\\1|")
+    if [[ -n "$proxy" ]]; then
+        WORK_PROXY_SERVER="$proxy"
+    fi
+    return 0
 }
 
 #-------------------------------------------------------------------------------
@@ -395,7 +400,6 @@ set_proxy_state() {
     local action="${1,,}"
     local service
     local services
-    local proxy_server
     local curlrc_file="${HOME}/.curlrc"
 
     # gather network services (skip header)
@@ -411,21 +415,19 @@ set_proxy_state() {
         if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             if [[ "$action" == "on" ]]; then
                 log_msg "Enabling automatic proxy for: $service"
-                networksetup -setautoproxyurl "$service" "${WPAD_DAT_URL}"
-                networksetup -setautoproxystate "$service" on
-
-                # attempt to parse WPAD proxy; WORK_PROXY_SERVER is set if found
-                parse_wpad_proxy
-                if [[ -n "${WORK_PROXY_SERVER}" ]]; then
-                    proxy_server="${WORK_PROXY_SERVER}"
+                if parse_wpad_proxy; then
+                    # WPAD fetched (proxy may be set or empty)
+                    log_msg "Using WPAD URL for system auto-proxy: ${WPAD_DAT_URL}"
+                    networksetup -setautoproxyurl "$service" "${WPAD_DAT_URL}"
+                    networksetup -setautoproxystate "$service" on
                 else
-                    log_msg "WARNING: WPAD lookup failed and no WORK_PROXY_SERVER defined"
+                    log_msg "Enabling automatic proxy discovery for: $service"
+                    networksetup -setproxyautodiscovery "$service" on
                 fi
 
-                # write to ~/.curlrc if not present
-                if [[ -n "${proxy_server}" ]]; then
-                    local line="proxy = ${proxy_server}"
-                    # Ensure curlrc file exists to avoid read errors
+                # Only write to ~/.curlrc if WORK_PROXY_SERVER is non-empty
+                if [[ -n "${WORK_PROXY_SERVER}" ]]; then
+                    local line="proxy = ${WORK_PROXY_SERVER}"
                     [[ -f "${curlrc_file}" ]] || touch "${curlrc_file}"
                     local curlrc
                     curlrc=$(<"${curlrc_file}")

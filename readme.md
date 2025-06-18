@@ -6,23 +6,22 @@
 Author: [Don Feliciano][id]<br />
 
 ### Overview
-A macOS daemon that performs actions based on your network location (work/home).
+A macOS daemon that performs actions based on your network location (work/non-work).
 
 ### Requirements
 
 - macOS 10.14 or later
-- Bash 4.0 or later (installed via Homebrew)
+- Bash 4.0 or later
 - GNU sed (`gsed`)
 - `jq`
 - `curl`
-- `terminal-notifier` (optional, for notifications)
+- `terminal-notifier` (optional, for toaster notifications)
 
 ### Features
 
-- Automatically detects work vs home location based on:
-  - Network SSID
-  - IP address pattern
+- Automatically detects work vs non-work location based on:
   - Domain suffix pattern
+  - Network SSID (if on Wi-Fi)
 
 - Performs the following actions when location changes:
   - Sets default printer
@@ -32,15 +31,11 @@ A macOS daemon that performs actions based on your network location (work/home).
 
 ### Installation
 
-1. Install dependencies via Homebrew:
+1. Install all dependencies via Homebrew (including optional `terminal-notifier`):
    ```bash
-   brew install bash jq curl gnu-sed
+   brew install bash jq curl gnu-sed terminal-notifier
    ```
-2. (Optional) Install `terminal-notifier` for macOS notifications:
-   ```bash
-   brew install terminal-notifier
-   ```
-3. Run the setup script:
+2. Run the setup script:
    ```bash
    ./setup
    ```
@@ -48,12 +43,22 @@ A macOS daemon that performs actions based on your network location (work/home).
 ### Configuration
 
 Setup will prompt for:
-- Work and home SSIDs
-- Work IP address pattern (e.g., "10.[0-9][0-9][0-9]")
-- Work and home domain patterns
-- Work and home printers
-- Work and home NTP servers
-- Various optional features
+  1. Work printer name (or "none")
+  2. Default printer name for non-work networks (or "none")
+  3. Whether or not to enable Notification Center alerts
+  4. Domain suffix pattern for work networks
+  5. SSID for work networks
+  6. Work NTP server
+  7. Default NTP server for non-work networks (time.apple.com)
+  8. Proxy server host:port for work networks (or leave blank)
+  9. Extra DNS search domains for work networks (or leave blank)
+  10. Automatically configure passwordless sudo access for required commands
+
+**Proxy server (item 8):**
+The specified proxy host:port will be written to `~/.curlrc` when switching to work mode and removed when switching to non-work mode. If a WPAD file (`wpad.dat`) is available and contains a proxy URL, that proxy takes priority over your manual setting.
+
+**Extra DNS search domains (item 9):**
+These domains are ones that your work network does not automatically push into `/var/run/resolv.conf`. They will be appended to your DNS search list when on work mode and ignored otherwise.
 
 Configuration is stored in `~/.netwatcher/config`; you can re-run setup anytime with `./setup -r`.
 
@@ -66,40 +71,20 @@ Configuration is stored in `~/.netwatcher/config`; you can re-run setup anytime 
 
 ### How It Works
 
-Netwatcher monitors network changes by watching:
-- /var/run/resolv.conf
-- Network interface status
-- SSID changes
-- Domain suffix changes
+netwatcher runs as a LaunchAgent and watches `/var/run/resolv.conf` for changes. When a change is detected, it:
 
-When changes occur, it evaluates the current network state against your configured work/home patterns to determine your location and performs the appropriate actions.
-
-- Watches /var/run/resolv.conf for changes to DNS search domains
-- Debounces rapid events using the -t throttle interval and allows interfaces to settle with -p
-- Prioritizes VPN interfaces (utun*)
-- Then wired links (non-Wi-Fi), preferring port names containing "Ethernet"
-- Falls back to Wi-Fi ports
-- Finally uses the system default route as a last resort
-- Verifies the interface is active by checking for an IPv4 or global-scope IPv6 address
-- Uses the get_ip_address() helper
-- Attempts ipconfig getifaddr <iface>
-- Falls back to parsing ifconfig <iface> output with awk
-- Reads DNS search domains from /var/run/resolv.conf
-- Compares against the configured WORK_DOMAIN_PATTERN to decide "work" vs "home"
-- In work mode:
-  - Enables automatic proxy (WPAD) and writes proxy = … to ~/.curlrc
-  - Sets NTP server to WORK_NTP_SERVER
-  - Configures default printer to WORK_PRINTER
-  - Applies any VPN DNS overrides and manages background services
-- In home mode:
-  - Disables the proxy and removes WPAD entries from ~/.curlrc
-  - Resets NTP server to HOME_NTP_SERVER
-  - Sets default printer to HOME_PRINTER
-  - Quits known VPN clients
-- Sends a macOS notification (via terminal-notifier) summarizing
-  - Active interface and local IP address
-  - Detected location mode (work/home)
-  - ISP, region, and city (if available)
+1. Waits for the configured throttle (`-t`) and pause (`-p`) intervals
+2. Determines the active network interface and its IP address
+3. Reads the DNS search domains from `/var/run/resolv.conf`
+4. Classifies the location as “work” or “non-work” based on:
+   - Matching any search domain against the configured work domain pattern
+   - Matching the current SSID against the configured work SSID (if on Wi-Fi)
+5. Executes the configured actions for the detected location:
+   - Enables or disables proxy settings (WPAD) and updates `~/.curlrc`
+   - Sets the NTP server and syncs the time
+   - Sets the default printer
+   - Quits VPN client when switching to non-work
+   - Sends a notification summarizing the change
 
 ### Troubleshooting
 
@@ -107,3 +92,4 @@ When changes occur, it evaluates the current network state against your configur
 - Use `sudo touch /var/run/resolv.conf` to trigger a check
 - Run `defaults read ~/Library/LaunchAgents/local.netwatcher.plist` to verify settings
 - Ensure `/etc/sudoers.d/<your_user>` exists with the required `NOPASSWD` entries (setup can create it)
+- To enable verbose debug logging, add `DEBUG="true"` to `~/.netwatcher/config`
