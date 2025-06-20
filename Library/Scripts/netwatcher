@@ -353,42 +353,42 @@ quit_program() {
     local client_path="${vpn_clients[${program}]:-}"
     if [[ -n "${client_path}" && ! -e "${client_path}" ]]; then
         log_msg "INFO: VPN client path not found: ${client_path}; skipping quit for ${program}"
-        return
+        return 0
     fi
 
     # Don't trap non-zero exit codes for this function
-    set +e
+    (
+        set +e
 
-    # Use AppleScript to quit if it's an app
-    if [[ -d "${client_path}" ]]; then
-        osascript <<EOF >/dev/null 2>&1 &
-            try
-                tell application "${friendly_name}" to quit
-            end try
+        # Use AppleScript to quit if it's an app
+        if [[ -d "${client_path}" ]]; then
+            osascript <<EOF >/dev/null 2>&1 &
+                try
+                    tell application "${friendly_name}" to quit
+                end try
 EOF
-        local aspid=$!
-        sleep 3
-        if kill -0 "${aspid}" 2>/dev/null; then
-            kill "${aspid}" 2>/dev/null
-            log_msg "WARNING: osascript quit for ${friendly_name} timed out"
+            local aspid=$!
+            sleep 3
+            if kill -0 "${aspid}" 2>/dev/null; then
+                kill "${aspid}" 2>/dev/null
+                log_msg "WARNING: osascript quit for ${friendly_name} timed out"
+            fi
         fi
-    fi
 
-    # Fallback force-kill by process name
-    pkill -f "${program}" >/dev/null 2>&1
-    killall "${friendly_name}" >/dev/null 2>&1
+        # Fallback force-kill by process name
+        pkill -f "${program}" >/dev/null 2>&1
+        killall "${friendly_name}" >/dev/null 2>&1
 
-    # Special handling: If Cisco Secure Client, also kill ciscod if present
-    if [[ "${program}" == "Cisco Secure Client" ]]; then
-        if [[ -n "${CISCO_VPN_BIN}" && -x "${CISCO_VPN_BIN}" ]]; then
-            pgrep ciscod >/dev/null && check_sudo_access && sudo pkill -f ciscod >/dev/null 2>&1
+        # Special handling: If Cisco Secure Client, also kill ciscod if present
+        if [[ "${program}" == "Cisco Secure Client" ]]; then
+            if [[ -n "${CISCO_VPN_BIN}" && -x "${CISCO_VPN_BIN}" ]]; then
+                pgrep ciscod >/dev/null && check_sudo_access && sudo pkill -f ciscod >/dev/null 2>&1
+            fi
         fi
-    fi
-
-    # Re-set our trap to catch errors again
-    set -e
+    )
 
     log_msg "${friendly_name}: stopped"
+    return 0
 }
 
 #-------------------------------------------------------------------------------
