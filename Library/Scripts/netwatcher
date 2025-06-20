@@ -6,23 +6,33 @@
 # Update PATH so we can rely on executables without full paths
 export PATH=/bin:/usr/bin:/sbin:/usr/sbin:/opt/homebrew/bin:/usr/local/bin
 
+# Enable ERR trap for error logging
+set -o errtrace
+trap 'log_msg "ERROR: Command \"$BASH_COMMAND\" exited with code $?. (line $LINENO)"' ERR
+
 #
 #    NAME
 #      netwatcher
 #
 #    DESCRIPTION
 #      This script is executed by the local.netwatcher LaunchAgent whenever
-#      /var/run/resolv.conf changes. Its purpose is to determine if the network
-#      environment has changed to or from a corporate (work) network, a home
+#      /var/run/resolv.conf changes. Its purpose is to detect when the network
+#      environment has changed to or from a corporate (work) network, a non-work
 #      network, or a VPN. It then configures system settings (proxies, printers,
-#      NTP, etc.) based on the detected environment.
+#      NTP, DNS search domains, etc.) based on the detected environment.
+#
+#      If you are connected via VPN (utun* interface), the script assumes this is a work connection and applies all work mode settings.
 #
 #      The script uses patterns (such as WORK_SSID and WORK_DOMAIN_PATTERN)
-#      defined in ${HOME}/.netwatcher/config to decide
-#      whether you're on the corporate network, at home, or connected via VPN.
+#      defined in ${HOME}/.netwatcher/config to determine the current environment.
 #
-#      The script also checks if certain VPN clients are running and can quit them
-#      when switching locations if needed.
+#      For efficiency, hardware port and network service information is cached
+#      at startup, avoiding redundant system calls during execution.
+#
+#      When switching locations, the script will attempt to quit any running VPN
+#      clients listed in the config.
+#
+#      Requires Bash 4.3+ and is intended to be run as /opt/homebrew/bin/bash.
 #
 #    CONFIGURATION
 #      Configuration is read from ${HOME}/.netwatcher/config which can define:
@@ -91,6 +101,32 @@ declare -A vpn_clients=(
     ["AWS VPN Client"]="/Applications/AWS VPN Client.app"
 )
 
+# Will store hardware ports (networksetup -listallhardwareports) for global reuse
+declare -a HW_LINES=()
+
+# Mapping interface (e.g. en0) -> service name
+declare -A IFACE_TO_SERVICE=()
+
+#-------------------------------------------------------------------------------
+# cache_service_order
+# DESCRIPTION:
+#   Builds an associative array mapping interface (e.g. en0) -> service name.
+cache_service_order() {
+    local service=""
+    local iface=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\([0-9]+\)\ (.+)$ ]]; then
+            service="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ Device:\ ([^[:space:]]+) ]]; then
+        iface="${BASH_REMATCH[1]}"
+        # Strip any trailing ')' from iface (e.g. "en8)")
+        iface="${iface//\)/}"
+        iface="$(echo "$iface" | xargs)"
+        IFACE_TO_SERVICE["$iface"]="$service"
+    fi
+    done < <(networksetup -listnetworkserviceorder)
+}
+
 #-------------------------------------------------------------------------------
 # Logging function
 # ARGUMENTS:
@@ -101,12 +137,12 @@ declare -A vpn_clients=(
 #   Prints a message to stdout, optionally without a trailing newline.
 log_msg() {
     local newline="yes"
-    if [[ $# -gt 0 && $1 == "-n" ]]; then
+    if [[ $# -gt 0 && ${1} == "-n" ]]; then
         newline="no"
         shift
     fi
 
-    if [[ "$newline" == "yes" ]]; then
+    if [[ "${newline}" == "yes" ]]; then
         printf '%s\n' "$*"
     else
         printf '%s' "$*"
@@ -126,7 +162,7 @@ if [[ -r "${CONFIG_FILE}" ]]; then
     : "${WORK_PRINTER:?ERROR: WORK_PRINTER must be set in config}"
     : "${DEFAULT_PRINTER:?ERROR: DEFAULT_PRINTER must be set in config}"
 
-    # When DEBUG=true in config, trace execution to a debug log file
+    # When ${DEBUG:-}==true in config, trace execution to a debug log file
     if [[ "${DEBUG:-}" == "true" ]]; then
         # Initialize debug log
         : >"${HOME}/.netwatcher/debug.log"
@@ -162,6 +198,39 @@ finish() {
 }
 
 #-------------------------------------------------------------------------------
+# check_dependencies
+# DESCRIPTION:
+#   Verifies that required tools and Bash version are available.
+check_dependencies() {
+    # Ensure Bash version is 4.3 or newer
+    if [[ -z "${BASH_VERSINFO:-}" ]] || ((BASH_VERSINFO[0] < 4)) || ((BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3)); then
+        log_msg "ERROR: Bash 4.3 or newer is required" >&2
+        exit 1
+    fi
+
+    # Ensure readarray builtin is available (Bash 4+)
+    if ! type readarray >/dev/null 2>&1; then
+        log_msg "ERROR: 'readarray' not found (requires Bash 4+)" >&2
+        exit 1
+    fi
+
+    # Check for required binaries
+    local dep
+    for dep in jq curl gsed; do
+        if ! command -v "${dep}" >/dev/null 2>&1; then
+            log_msg "ERROR: '${dep}' is required but not installed" >&2
+            exit 1
+        fi
+    done
+
+    # Check for sudo access (passwordless) for required commands
+    if ! check_sudo_access; then
+        log_msg "ERROR: Passwordless sudo access for required commands is not configured" >&2
+        exit 1
+    fi
+}
+
+#-------------------------------------------------------------------------------
 # check_sudo_access
 # ARGUMENTS:
 #   None.
@@ -181,7 +250,7 @@ check_sudo_access() {
     # Only essential commands remain
     local commands=(/bin/mkdir /usr/bin/tee /bin/chmod /bin/rm /usr/sbin/networksetup /usr/sbin/sntp /usr/sbin/systemsetup /usr/bin/killall /usr/bin/pkill)
     for cmd in "${commands[@]}"; do
-        if [[ "$sudoout" != *"${cmd}"* ]]; then
+        if [[ "${sudoout}" != *"${cmd}"* ]]; then
             log_msg "ERROR: ${user_id} does not have required sudo access for ${cmd}"
             return 1
         fi
@@ -215,47 +284,8 @@ purge_log() {
 #   Used for neat log formatting.
 print_dashes() {
     local num_dashes="$1"
-    local dash_count=0
-    for ((dash_count = 0; dash_count != num_dashes; dash_count++)); do
-        printf '%s' '-'
-    done
-}
-
-#-------------------------------------------------------------------------------
-# check_throttle
-# ARGUMENTS:
-#   $1 : Path to the timestamp file.
-# DESCRIPTION:
-#   Checks if the script ran within the throttle period to avoid frequent execution.
-#   If the script ran less than THROTTLE seconds ago, it logs a message and exits.
-# RETURNS:
-#   0 if the script ran within the throttle period, 1 otherwise.
-check_throttle() {
-    local now timestamp_file="$1"
-    now="$(date +%s)" || return 1
-
-    if [[ -f "${timestamp_file}" ]]; then
-        local last_update
-        last_update="$(stat -f %m "${timestamp_file}")" || return 1
-        if (((now - last_update) < THROTTLE)); then
-            log_msg "Ran less than ${THROTTLE} seconds ago, exiting."
-            return 0
-        fi
-    fi
-    return 1
-}
-
-#-------------------------------------------------------------------------------
-# wait_for_interfaces
-# ARGUMENTS:
-#   $1 : Number of seconds to wait.
-# DESCRIPTION:
-#   Waits for the specified number of seconds to allow network interfaces to settle.
-#   Logs the countdown to the log file.
-wait_for_interfaces() {
-    local pause_time="$1"
-    log_msg "Waiting for interfaces to settle for ${pause_time} seconds"
-    sleep "${pause_time}"
+    # Print a line of num_dashes hyphens
+    printf '%*s\n' "$num_dashes" '' | tr ' ' '-'
 }
 
 #-------------------------------------------------------------------------------
@@ -284,164 +314,132 @@ notify() {
 }
 
 #-------------------------------------------------------------------------------
-# turn_on_airport
+# check_throttle
 # ARGUMENTS:
-#   $1 : Wi-Fi interface
+#   $1 : Path to the timestamp file.
 # DESCRIPTION:
-#   Ensures Wi-Fi is powered on. Useful if it was turned off when connecting Ethernet.
-turn_on_airport() {
-    local interface="${1:-}"
-    [[ -z "${interface}" ]] && log_msg "ERROR: No interface specified" && return 1
+#   Checks if the script ran within the throttle period to avoid frequent execution.
+#   If the script ran less than THROTTLE seconds ago, it logs a message and exits.
+# RETURNS:
+#   0 if the script ran within the throttle period, 1 otherwise.
+check_throttle() {
+    local now timestamp_file="$1"
+    now="$(date +%s)" || return 1
 
-    if ! networksetup -setairportpower "${interface}" on; then
-        log_msg "ERROR: Failed to enable WiFi on ${interface}"
-        return 1
-    fi
-}
-
-#-------------------------------------------------------------------------------
-# turn_off_airport
-# ARGUMENTS:
-#   $1 : Wi-Fi interface
-# DESCRIPTION:
-#   Turns Wi-Fi off, then waits 5 seconds. Used in scenarios where Ethernet takes precedence.
-turn_off_airport() {
-    local interface="${1:-}"
-    [[ -z "${interface}" ]] && log_msg "ERROR: No interface specified" && return 1
-
-    if ! networksetup -setairportpower "${interface}" off; then
-        log_msg "ERROR: Failed to disable WiFi on ${interface}"
-        return 1
-    fi
-    sleep 5
-}
-
-#-------------------------------------------------------------------------------
-# add_work_dns_suffixes
-# DESCRIPTION:
-#   Adds DNS search suffixes for OCI when on VPN
-add_work_dns_suffixes() {
-    if check_sudo_access; then
-        # The following commands require passwordless sudo for ONLY /etc/resolver/vpn
-        sudo mkdir -p /etc/resolver
-
-        # Define the resolver file path
-        local resolver_file="/etc/resolver/vpn"
-
-        # Use search domains from config file
-        if [[ -z "${WORK_SEARCH_DOMAINS:-}" ]]; then
-            log_msg "No WORK_SEARCH_DOMAINS defined in config; skipping DNS search suffixes"
-            return
+    if [[ -f "${timestamp_file}" ]]; then
+        local last_update
+        last_update="$(stat -f %m "${timestamp_file}")" || return 1
+        if (((now - last_update) < ${THROTTLE})); then
+            log_msg "Ran less than ${THROTTLE} seconds ago, exiting."
+            return 0
         fi
-
-        echo -e "search ${WORK_SEARCH_DOMAINS:-}" | sudo tee "${resolver_file}" >/dev/null 2>&1
-        sudo chmod 644 "${resolver_file}" 2>/dev/null
     fi
+    return 1
 }
 
 #-------------------------------------------------------------------------------
-# remove_work_dns_suffixes
+# quit_program
+# ARGUMENTS:
+#   $1 : Program name or pattern
 # DESCRIPTION:
-#   Removes DNS search suffixes for OCI when not on VPN
-remove_work_dns_suffixes() {
-    # Remove DNS search domains and any resolver overrides
-    if ! check_sudo_access; then
-        log_msg "ERROR: Cannot remove DNS search suffixes (no sudo access)"
+#   Tries to gracefully quit a program via AppleScript. If that fails, force-kills it.
+#   Used to stop VPN clients or other location-specific apps when switching networks.
+quit_program() {
+    local program="${1:-}"
+    local friendly_name
+    friendly_name="$(echo "${program}" | cut -d '.' -f 1)"
+
+    # Only attempt to quit/kill if the binary or app is present
+    local client_path="${vpn_clients[${program}]:-}"
+    if [[ -n "${client_path}" && ! -e "${client_path}" ]]; then
+        log_msg "INFO: VPN client path not found: ${client_path}; skipping quit for ${program}"
         return
     fi
 
-    # Clear search domains on all network services
-    local all_services services service
-    mapfile -t all_services < <(networksetup -listallnetworkservices)
-    services=("${all_services[@]:1}")
-    for service in "${services[@]}"; do
-        networksetup -setsearchdomains "$service" empty 2>/dev/null ||
-            log_msg "WARNING: failed to clear search domains for $service"
-    done
-
-    # Remove custom resolver file if present
-    local resolver_file="/etc/resolver/vpn"
-    if [[ -f "$resolver_file" ]]; then
-        sudo rm -f "$resolver_file" &&
-            log_msg "Removed resolver override: $resolver_file" ||
-            log_msg "WARNING: failed to remove $resolver_file"
-    fi
-}
-
-#-------------------------------------------------------------------------------
-# parse_wpad_proxy
-# DESCRIPTION:
-#   Fetches the WPAD file and extracts the proxy server. Returns 0 if fetch succeeded,
-#   1 on curl failure. Sets WORK_PROXY_SERVER if a proxy is parsed.
-parse_wpad_proxy() {
-    local proxy curl_status
-    proxy=$(curl --connect-timeout 3 --max-time 5 --noproxy '*' \
-        -s "${WPAD_DAT_URL}" 2>/dev/null)
-    curl_status=$?
-    if (( curl_status != 0 )); then
-        return 1
-    fi
-    # Attempt to extract a proxy URL
-    proxy=$(printf '%s' "$proxy" | grep -E 'proxies =' | \
-        gsed "s|^\\s*proxies\\s*=\\s*\"PROXY\\s*\\([A-Za-z0-9\\.:/-]*\\);.*$|\\1|")
-    if [[ -n "$proxy" ]]; then
-        WORK_PROXY_SERVER="$proxy"
-    fi
-    return 0
-}
-
-#-------------------------------------------------------------------------------
-# set_proxy_state
-# ARGUMENTS:
-#   $1 : “on” or “off”
-# DESCRIPTION:
-#   Enables or disables WPAD-based automatic proxy on each network service
-set_proxy_state() {
-    local action="${1,,}"
-    local service
-    local services
-    local curlrc_file="${HOME}/.curlrc"
-
-    # gather network services (skip header)
-    mapfile -t all_services < <(networksetup -listallnetworkservices)
-    services=("${all_services[@]:1}")
-    for service in "${services[@]}"; do
-        # get only the first IPv4 address
-        local ip
-        ip=$(networksetup -getinfo "$service" |
-            awk -F': ' '/^IP address:/ { print $2; exit }' |
-            xargs)
-
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            if [[ "$action" == "on" ]]; then
-                if parse_wpad_proxy; then
-                    log_msg "Enabling automatic proxy (${WPAD_DAT_URL}) for: $service"
-                    networksetup -setautoproxyurl "$service" "${WPAD_DAT_URL}"
-                    networksetup -setautoproxystate "$service" on
-                else
-                    log_msg "Enabling automatic proxy discovery for: $service"
-                    networksetup -setproxyautodiscovery "$service" on
-                fi
-
-                # Only write to ~/.curlrc if WORK_PROXY_SERVER is non-empty
-                if [[ -n "${WORK_PROXY_SERVER}" ]]; then
-                    local line="proxy = ${WORK_PROXY_SERVER}"
-                    [[ -f "${curlrc_file}" ]] || touch "${curlrc_file}"
-                    local curlrc
-                    curlrc=$(<"${curlrc_file}")
-                    if [[ $curlrc != *"${line}"* ]]; then
-                        echo "${line}" >>"${curlrc_file}"
-                    fi
-                fi
-            else
-                log_msg "Disabling automatic proxy for: $service"
-                networksetup -setautoproxystate "$service" off
-                # Remove proxy line if curlrc exists
-                [[ -f "${curlrc_file}" ]] && gsed -i "/^proxy = /d" "${curlrc_file}"
-            fi
+    # Use AppleScript to quit if it's an app
+    if [[ -d "${client_path}" ]]; then
+        osascript <<EOF >/dev/null 2>&1 &
+            try
+                tell application "${friendly_name}" to quit
+            end try
+EOF
+        local aspid=$!
+        sleep 3
+        if kill -0 "${aspid}" 2>/dev/null; then
+            kill "${aspid}" 2>/dev/null
+            log_msg "WARNING: osascript quit for ${friendly_name} timed out"
         fi
-    done
+    fi
+
+    # Fallback force-kill by process name
+    pkill -f "${program}" >/dev/null 2>&1
+    killall "${friendly_name}" >/dev/null 2>&1
+
+    # Special handling: If Cisco Secure Client, also kill ciscod if present
+    if [[ "${program}" == "Cisco Secure Client" ]]; then
+        if [[ -n "${CISCO_VPN_BIN}" && -x "${CISCO_VPN_BIN}" ]]; then
+            pgrep ciscod >/dev/null && check_sudo_access && sudo pkill -f ciscod >/dev/null 2>&1
+        fi
+    fi
+
+    log_msg "${friendly_name}: stopped"
 }
+
+#-------------------------------------------------------------------------------
+# wait_for_interfaces
+# ARGUMENTS:
+#   $1 : Number of seconds to wait.
+# DESCRIPTION:
+#   Waits for the specified number of seconds to allow network interfaces to settle.
+#   Logs the countdown to the log file.
+wait_for_interfaces() {
+    local pause_time="$1"
+    log_msg "Waiting for interfaces to settle for ${pause_time} seconds"
+    sleep "${pause_time}"
+}
+
+#-------------------------------------------------------------------------------
+# get_ssid
+# ARGUMENTS:
+#   $1 : Wi-Fi interface (e.g. en1)
+# DESCRIPTION:
+#   Retrieves the current SSID. Tries in order:
+#     1. ipconfig getsummary (no sudo)
+#     2. wdutil info (if available, no sudo)
+#     3. networksetup -getairportnetwork as a fallback
+get_ssid() {
+    local interface="${1:-}"
+    local ssid
+
+    # 1. Try ipconfig getsummary
+    if command -v ipconfig >/dev/null 2>&1; then
+        ssid=$(ipconfig getsummary "$interface" 2>/dev/null |
+            awk -F': ' '/^ *SSID/ {print $2; exit}')
+        if [[ -n "${ssid}" ]]; then
+            printf '%s' "${ssid}"
+            return
+        fi
+    fi
+
+    # 2. Try wdutil info (macOS 14+), no sudo to avoid prompts
+    if command -v wdutil >/dev/null 2>&1; then
+        ssid=$(wdutil info 2>/dev/null |
+            awk -F': ' '/SSID/ {print $2; exit}')
+        if [[ -n "${ssid}" ]]; then
+            printf '%s' "${ssid}"
+            return
+        fi
+    fi
+
+    # 3. Fallback to networksetup service-based lookup
+    if ssid=$(networksetup -getairportnetwork "Wi-Fi" 2>/dev/null |
+        sed -E 's/^Current Wi-Fi Network: //'); then
+        printf '%s' "${ssid}"
+    else
+        printf ''
+    fi
+}
+
 #-------------------------------------------------------------------------------
 # get_ip_address
 # ARGUMENTS:
@@ -490,95 +488,221 @@ get_interface_status() {
 }
 
 #-------------------------------------------------------------------------------
-# get_ssid
+# get_default_interface
 # ARGUMENTS:
-#   $1 : Wi-Fi interface (e.g. en1)
+#   $1 : Name of HW_LINES array variable (passed by reference)
 # DESCRIPTION:
-#   Retrieves the current SSID. Tries in order:
-#     1. ipconfig getsummary (no sudo)
-#     2. wdutil info (if available, no sudo)
-#     3. networksetup -getairportnetwork as a fallback
-get_ssid() {
-    local interface="${1:-}"
-    local ssid
+#     Returns the active interface, preferring VPN (utun*), then wired (non-Wi-Fi),
+#     prioritizing those whose port name contains "Ethernet", then Wi-Fi, then default route.
+get_default_interface() {
+    local -n hw_lines_ref=$1
+    # build mapping of device -> port name
+    declare -A port_map
+    local port_name device_line device
+    for ((i = 0; i < ${#hw_lines_ref[@]}; i++)); do
+        if [[ ${hw_lines_ref[i]} == Hardware\ Port:* ]]; then
+            port_name=${hw_lines_ref[i]#Hardware Port: }
+            device_line=${hw_lines_ref[i + 1]}
+            device=${device_line#Device: }
+            port_map["$device"]="$port_name"
+        fi
+    done
 
-    # 1. Try ipconfig getsummary
-    if command -v ipconfig >/dev/null 2>&1; then
-        ssid=$(ipconfig getsummary "$interface" 2>/dev/null |
-            awk -F': ' '/^ *SSID/ {print $2; exit}')
-        if [[ -n "${ssid}" ]]; then
-            printf '%s' "${ssid}"
+    # collect active interfaces
+    local iface active_ifaces=()
+    for iface in "${!port_map[@]}"; do
+        if [[ "$(get_interface_status "$iface")" == "active" ]]; then
+            active_ifaces+=("$iface")
+        fi
+    done
+
+    # VPN interface (utun*) wins first
+    for iface in "${active_ifaces[@]}"; do
+        if [[ "$iface" == utun* ]]; then
+            printf '%s' "$iface"
             return
         fi
+    done
+
+    # wired interfaces: non-Wi-Fi
+    local wired=()
+    for iface in "${active_ifaces[@]}"; do
+        if [[ "${port_map[$iface]}" != "Wi-Fi" ]]; then
+            wired+=("$iface")
+        fi
+    done
+    if [[ ${#wired[@]} -gt 0 ]]; then
+        # prefer those named Ethernet
+        for iface in "${wired[@]}"; do
+            if [[ "${port_map[$iface]}" == *Ethernet* ]]; then
+                printf '%s' "$iface"
+                return
+            fi
+        done
+        # then prefer "USB.*LAN" (e.g. "USB 10/100/1000 LAN")
+        for iface in "${wired[@]}"; do
+            if [[ "${port_map[$iface]}" =~ ^USB.*LAN$ ]]; then
+                printf '%s' "$iface"
+                return
+            fi
+        done
+        # fallback to first wired
+        printf '%s' "${wired[0]}"
+        return
     fi
 
-    # 2. Try wdutil info (macOS 14+), no sudo to avoid prompts
-    if command -v wdutil >/dev/null 2>&1; then
-        ssid=$(wdutil info 2>/dev/null |
-            awk -F': ' '/SSID/ {print $2; exit}')
-        if [[ -n "${ssid}" ]]; then
-            printf '%s' "${ssid}"
+    # then Wi-Fi
+    for iface in "${active_ifaces[@]}"; do
+        if [[ "${port_map[$iface]}" == "Wi-Fi" ]]; then
+            printf '%s' "$iface"
             return
         fi
+    done
+
+    # fallback to default route
+    route get default 2>/dev/null | awk '/interface:/{print $2}'
+}
+
+#-------------------------------------------------------------------------------
+# get_service_for_interface
+# ARGUMENTS:
+#   $1 : Interface name (e.g. en0)
+#   $2 : Variable name to store the result (passed by reference)
+# RETURNS:
+#   Sets the given variable to the Network Service Name, or empty string if not found
+get_service_for_interface() {
+    local iface="$1"
+    declare -n ref="$2"
+    ref="${IFACE_TO_SERVICE[$iface]}"
+}
+
+#-------------------------------------------------------------------------------
+# configure_dns_search
+# ARGUMENTS:
+#   $1 : "add" or "remove"
+# DESCRIPTION:
+#   Adds or removes DNS search suffixes for work VPN as needed.
+configure_dns_search() {
+    local action="$1"
+    local resolver_file="/etc/resolver/vpn"
+
+    if [[ "$action" == "add" ]]; then
+        if check_sudo_access; then
+            sudo mkdir -p /etc/resolver
+
+    if [[ -z "${WORK_SEARCH_DOMAINS:-}" ]]; then
+        log_msg "No WORK_SEARCH_DOMAINS defined in config; skipping DNS search suffixes"
+        return
     fi
 
-    # 3. Fallback to networksetup service-based lookup
-    if ssid=$(networksetup -getairportnetwork "Wi-Fi" 2>/dev/null |
-        sed -E 's/^Current Wi-Fi Network: //'); then
-        printf '%s' "${ssid}"
+    echo -e "search ${WORK_SEARCH_DOMAINS:-}" | sudo tee "${resolver_file}" >/dev/null 2>&1
+    sudo chmod 644 "${resolver_file}" 2>/dev/null
+        fi
+    elif [[ "$action" == "remove" ]]; then
+        if ! check_sudo_access; then
+            log_msg "ERROR: Cannot remove DNS search suffixes (no sudo access)"
+            return
+        fi
+
+        local all_services services service
+        mapfile -t all_services < <(networksetup -listallnetworkservices)
+        services=("${all_services[@]:1}")
+    for service in "${services[@]}"; do
+        networksetup -setsearchdomains "${service}" empty 2>/dev/null ||
+            log_msg "WARNING: failed to clear search domains for ${service}"
+    done
+
+    if [[ -f "${resolver_file}" ]]; then
+        sudo rm -f "${resolver_file}" &&
+            log_msg "Removed resolver override: ${resolver_file}" ||
+            log_msg "WARNING: failed to remove ${resolver_file}"
+    fi
     else
-        printf ''
+        log_msg "ERROR: configure_dns_search called with invalid argument: $action"
+        return 1
     fi
 }
 
 #-------------------------------------------------------------------------------
-# get_program_status
-# ARGUMENTS:
-#   $1 : Program name or pattern
+# parse_wpad_proxy
 # DESCRIPTION:
-#   Checks if a given program (identified by pattern) is currently running.
-#   Useful for conditional quits or checks.
-get_program_status() {
-    local program="${1:-}"
-    local pid_list
-    pid_list="$(pgrep -f "${program}")"
-    if [[ -z "${pid_list}" ]]; then
-        printf 'inactive'
-    else
-        printf 'active'
+#   Fetches the WPAD file and extracts the proxy server. Returns 0 if fetch succeeded,
+#   1 on curl failure. Sets WORK_PROXY_SERVER if a proxy is parsed.
+parse_wpad_proxy() {
+    local proxy curl_status
+    proxy=$(curl --connect-timeout 3 --max-time 5 --noproxy '*' \
+        -s "${WPAD_DAT_URL}" 2>/dev/null)
+    curl_status=$?
+    if ((curl_status != 0)); then
+        return 1
     fi
+    # Attempt to extract a proxy URL
+    proxy=$(printf '%s' "$proxy" | grep -E 'proxies =' |
+        gsed "s|^\\s*proxies\\s*=\\s*\"PROXY\\s*\\([A-Za-z0-9\\.:/-]*\\);.*$|\\1|")
+    if [[ -n "${proxy}" ]]; then
+        WORK_PROXY_SERVER="${proxy}"
+    fi
+    return 0
 }
 
 #-------------------------------------------------------------------------------
-# quit_program
+# set_proxy_state
 # ARGUMENTS:
-#   $1 : Program name or pattern
+#   $1 : “on” or “off”
+#   $2 : Interface name (e.g. en0)
 # DESCRIPTION:
-#   Tries to gracefully quit a program via AppleScript. If that fails, force-kills it.
-#   Used to stop VPN clients or other location-specific apps when switching networks.
-quit_program() {
-    local program="${1:-}"
-    local friendly_name
-    friendly_name="$(echo "${program}" | cut -d '.' -f 1)"
+#   Enables or disables WPAD-based automatic proxy on the given network service
+set_proxy_state() {
+    local action="${1,,}"
+    local iface="${2:-}"
+    local curlrc_file="${HOME}/.curlrc"
+    local service=""
 
-    # Use asynchronous AppleScript to avoid hanging if the application won’t respond
-    # Allows a 3-second timeout before forcing a kill
-    osascript <<EOF >/dev/null 2>&1 &
-        try
-            tell application "${friendly_name}" to quit
-        end try
-EOF
-    local aspid=$!
-    # Allow AppleScript 3 seconds to quit
-    sleep 3
-    if kill -0 "${aspid}" 2>/dev/null; then
-        kill "${aspid}" 2>/dev/null
-        log_msg "WARNING: osascript quit for ${friendly_name} timed out"
+    if [[ -z "${iface}" ]]; then
+        log_msg "ERROR: set_proxy_state requires interface argument"
+        return 1
     fi
-    # Fallback force-kill
-    pkill -f "${program}" >/dev/null 2>&1
-    killall "${friendly_name}" >/dev/null 2>&1
-    log_msg "${friendly_name}: stopped"
+
+    get_service_for_interface "${iface}" service
+
+    if [[ -z "${service}" ]]; then
+        log_msg "ERROR: Could not determine network service for interface ${iface}"
+        return 1
+    fi
+    # get only the first IPv4 address
+    local ip
+    ip=$(networksetup -getinfo "${service}" |
+        awk -F': ' '/^IP address:/ { print $2; exit }' |
+        xargs)
+    if [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ "${action}" == "on" ]]; then
+            if parse_wpad_proxy; then
+                log_msg "Enabling automatic proxy (${WPAD_DAT_URL}) for: ${service}"
+                networksetup -setautoproxyurl "${service}" "${WPAD_DAT_URL}"
+                networksetup -setautoproxystate "${service}" on
+            else
+                log_msg "Enabling automatic proxy discovery for: ${service}"
+                networksetup -setproxyautodiscovery "${service}" on
+            fi
+            # Only write to ~/.curlrc if WORK_PROXY_SERVER is non-empty
+            if [[ -n "${WORK_PROXY_SERVER}" ]]; then
+                local line="proxy = ${WORK_PROXY_SERVER}"
+                [[ -f "${curlrc_file}" ]] || touch "${curlrc_file}"
+                local curlrc
+                curlrc=$(<"${curlrc_file}")
+                if [[ ${curlrc} != *"${line}"* ]]; then
+                    echo "${line}" >>"${curlrc_file}"
+                fi
+            fi
+        else
+            log_msg "Disabling automatic proxy for: ${service}"
+            networksetup -setautoproxystate "${service}" off
+            # Remove proxy line if curlrc exists
+            if [[ -f "${curlrc_file}" ]]; then
+                gsed -i "/^proxy = /d" "${curlrc_file}"
+            fi
+        fi
+    fi
 }
 
 #-------------------------------------------------------------------------------
@@ -607,7 +731,7 @@ set_ntp_server() {
     if check_sudo_access; then
         log_msg "Setting time source to: ${ntp_server}"
         sudo systemsetup -setnetworktimeserver "${ntp_server}" >/dev/null 2>&1
-        log_msg "Syncing time with NTP server: ${ntp_server}"
+        log_msg "Syncing clock with NTP server: ${ntp_server}"
         # Sync time, but don’t hang the whole script if sntp can’t reach the server
         (
             sudo sntp -sS "${ntp_server}" >/dev/null 2>&1 &
@@ -647,13 +771,13 @@ get_connection_info() {
     local api="http://ip-api.com/json"
     # build curl command as an array to preserve quoting
     local -a curl_cmd=(curl --connect-timeout 3 --max-time 5 -s)
-    if [[ "$location" == "work" ]]; then
+    if [[ "${location}" == "work" ]]; then
         [[ -n "${WORK_PROXY_SERVER:-}" ]] && curl_cmd+=(-x "${WORK_PROXY_SERVER}")
     else
         curl_cmd+=(--noproxy '*')
     fi
 
-    [[ "$address" != "null" ]] && api+="/${address}"
+    [[ "${address}" != "null" ]] && api+="/${address}"
 
     # fetch data
     local response
@@ -678,6 +802,7 @@ get_connection_info() {
 # ARGUMENTS:
 #   $1 : "work" or "non-work"
 #   $2 : IP address string
+#   $3 : Interface name
 # DESCRIPTION:
 #   Applies location-specific settings:
 #     - At work: enable proxies, set NTP, set default printer, optionally gather VPN server info.
@@ -685,6 +810,7 @@ get_connection_info() {
 switch_location() {
     local location="${1:-}"
     local ip_address="${2:-}"
+    local iface="${3:-}"
     local notify_msg="Local IP: ${ip_address}"
     local connection_info=""
     local isp=""
@@ -693,10 +819,10 @@ switch_location() {
         local vpn_ip
         local vpn_proto
 
-        set_proxy_state on
+        set_proxy_state on "${iface}"
         set_ntp_server "${WORK_NTP_SERVER:-}"
         set_default_printer "${WORK_PRINTER:-}"
-        add_work_dns_suffixes
+        configure_dns_search add
 
         sleep 3
 
@@ -705,7 +831,7 @@ switch_location() {
             local i=0
             local vpn_stats=()
             for vpn_stat_field in $("${CISCO_VPN_BIN}" stats 2>/dev/null | awk '/Server Address:/ || /Protocol:/ { print $NF }'); do
-                vpn_stats[i]="$vpn_stat_field"
+                vpn_stats[i]="${vpn_stat_field}"
                 i=$((i + 1))
             done
             if ((${#vpn_stats[@]} > 0)); then
@@ -716,10 +842,10 @@ switch_location() {
             fi
         fi
     else
-        set_proxy_state off
+        set_proxy_state off "${iface}"
         set_ntp_server "${DEFAULT_NTP_SERVER}"
         set_default_printer "${DEFAULT_PRINTER:-}"
-        remove_work_dns_suffixes
+        configure_dns_search remove
 
         local client_name
         for client_name in "${!vpn_clients[@]}"; do
@@ -727,14 +853,12 @@ switch_location() {
                 quit_program "${client_name}"
             fi
         done
-        check_sudo_access && sudo pkill -f ciscod >/dev/null 2>&1
     fi
 
     if [[ -n "${connection_info:-}" ]]; then
         :
     else
-        # Prevent a failed geo-IP lookup from terminating the script (set -e)
-        # Attempt to fetch connection info, but do not exit on failure
+        # Attempt to fetch connection info
         connection_info=$(get_connection_info "${location}" 2>/dev/null) || connection_info=""
     fi
 
@@ -757,112 +881,14 @@ switch_location() {
 }
 
 #-------------------------------------------------------------------------------
-# check_dependencies
-# DESCRIPTION:
-#   Verifies that required tools and Bash version are available.
-check_dependencies() {
-    # Ensure Bash version is 4.3 or newer
-    if [[ -z "${BASH_VERSINFO:-}" ]] || ((BASH_VERSINFO[0] < 4)) || ((BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3)); then
-        log_msg "ERROR: Bash 4.3 or newer is required" >&2
-        exit 1
-    fi
-
-    # Ensure readarray builtin is available (Bash 4+)
-    if ! type readarray >/dev/null 2>&1; then
-        log_msg "ERROR: 'readarray' not found (requires Bash 4+)" >&2
-        exit 1
-    fi
-
-    # Check for required binaries
-    local dep
-    for dep in jq curl gsed; do
-        if ! command -v "${dep}" >/dev/null 2>&1; then
-            log_msg "ERROR: '${dep}' is required but not installed" >&2
-            exit 1
-        fi
-    done
-
-    # Check for sudo access (passwordless) for required commands
-    if ! check_sudo_access; then
-        log_msg "ERROR: Passwordless sudo access for required commands is not configured" >&2
-        exit 1
-    fi
-}
-
-#-------------------------------------------------------------------------------
-# get_default_interface
-# DESCRIPTION:
-#     Returns the active interface, preferring VPN (utun*), then wired (non-Wi-Fi),
-#     prioritizing those whose port name contains "Ethernet", then Wi-Fi, then default route.
-get_default_interface() {
-    # build mapping of device -> port name
-    declare -A port_map
-    local hw_lines port_name device_line device
-    mapfile -t hw_lines < <(networksetup -listallhardwareports)
-    for ((i = 0; i < ${#hw_lines[@]}; i++)); do
-        if [[ ${hw_lines[i]} == Hardware\ Port:* ]]; then
-            port_name=${hw_lines[i]#Hardware Port: }
-            device_line=${hw_lines[i + 1]}
-            device=${device_line#Device: }
-            port_map["$device"]="$port_name"
-        fi
-    done
-
-    # collect active interfaces
-    local iface active_ifaces=()
-    for iface in "${!port_map[@]}"; do
-        if [[ "$(get_interface_status "$iface")" == "active" ]]; then
-            active_ifaces+=("$iface")
-        fi
-    done
-
-    # VPN interface (utun*) wins first
-    for iface in "${active_ifaces[@]}"; do
-        if [[ "$iface" == utun* ]]; then
-            printf '%s' "$iface"
-            return
-        fi
-    done
-
-    # wired interfaces: non-Wi-Fi
-    local wired=()
-    for iface in "${active_ifaces[@]}"; do
-        if [[ "${port_map[$iface]}" != "Wi-Fi" ]]; then
-            wired+=("$iface")
-        fi
-    done
-    if [[ ${#wired[@]} -gt 0 ]]; then
-        # prefer those named Ethernet
-        for iface in "${wired[@]}"; do
-            if [[ "${port_map[$iface]}" == *Ethernet* ]]; then
-                printf '%s' "$iface"
-                return
-            fi
-        done
-        # otherwise first wired
-        printf '%s' "${wired[0]}"
-        return
-    fi
-
-    # then Wi-Fi
-    for iface in "${active_ifaces[@]}"; do
-        if [[ "${port_map[$iface]}" == "Wi-Fi" ]]; then
-            printf '%s' "$iface"
-            return
-        fi
-    done
-
-    # fallback to default route
-    route get default 2>/dev/null | awk '/interface:/{print $2}'
-}
-
-#-------------------------------------------------------------------------------
 # main
 # ARGUMENTS:
 #     -t secs : Throttle time between network changes
 #     -p secs : Pause time to allow interfaces to settle
 # DESCRIPTION:
 #     Detects the single active interface by default route, then sets location.
+#-------------------------------------------------------------------------------
+
 main() {
     check_dependencies
     local OPTIND=1
@@ -894,40 +920,44 @@ main() {
 
     [[ "${PAUSE_TO_SETTLE:-n}" == "y" ]] && wait_for_interfaces "${PAUSE_TIME}"
 
+    # Cache hardware ports for all lookups
+    mapfile -t HW_LINES < <(networksetup -listallhardwareports)
+
+    # Cache mapping of interface -> service name
+    cache_service_order
+
     # Choose the primary network interface to configure:
     # uses get_default_interface(), which prefers VPN (utun*), then wired Ethernet, then Wi‑Fi,
     # and falls back to the system default route if none match.
     local iface
-    iface="$(get_default_interface)"
+    iface="$(get_default_interface HW_LINES)"
     # If no interface is found, abort to avoid applying settings to the wrong device
-    if [[ -z "$iface" ]]; then
+    if [[ -z "${iface}" ]]; then
         log_msg "ERROR: Unable to determine active interface"
         finish
     fi
     # Convert the device identifier (e.g., en0) to a user-friendly Hardware Port name
-    # by parsing `networksetup -listallhardwareports`
-    local hw_port
-    hw_port=$(
-        networksetup -listallhardwareports |
-            awk -v dev="$iface" '
-        /^Hardware Port:/ { port=$0 }
-        /Device: / {
-          if ($2 == dev) {
-            sub(/^Hardware Port: /, "", port)
-            print port
-            exit
-          }
-        }'
-    )
+    # by parsing cached HW_LINES
+    local hw_port=""
+    for ((i = 0; i < ${#HW_LINES[@]}; i++)); do
+        if [[ ${HW_LINES[i]} == Hardware\ Port:* ]]; then
+            local port=${HW_LINES[i]#Hardware Port: }
+            local devline=${HW_LINES[i + 1]}
+            if [[ ${devline} == Device:\ ${iface} ]]; then
+                hw_port=${port}
+                break
+            fi
+        fi
+    done
     # Log which interface we will use (friendly name if available, otherwise raw device)
-    log_msg "The active interface is: ${hw_port:-$iface}"
+    log_msg "The active interface is: ${hw_port:-${iface}}"
 
     # Retrieve the IPv4 address for the chosen interface.
     # If it fails to produce a valid IPv4, exit since the script requires IPv4 connectivity.
     local ip_addr
-    ip_addr=$(get_ip_address "$iface")
-    if [[ ! "$ip_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        log_msg "ERROR: Interface $iface has no valid IPv4 address"
+    ip_addr=$(get_ip_address "${iface}")
+    if [[ ! "${ip_addr}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_msg "ERROR: Interface ${iface} has no valid IPv4 address"
         finish
     fi
 
@@ -935,22 +965,16 @@ main() {
     local resolv_data
     # Note: on macOS /var/run/resolv.conf holds current DNS domains
     resolv_data=$(</var/run/resolv.conf)
-    if [[ "$resolv_data" =~ ${WORK_DOMAIN_PATTERN} ]]; then
-        switch_location "work" "$ip_addr"
-    elif [[ "$hw_port" == "Wi-Fi" ]] && [[ "$(get_ssid "$iface")" == "${WORK_SSID}" ]]; then
-        switch_location "work" "$ip_addr"
+    if [[ "${resolv_data}" =~ ${WORK_DOMAIN_PATTERN} ]]; then
+        switch_location "work" "${ip_addr}" "${iface}"
+    elif [[ "${hw_port}" == "Wi-Fi" ]] && [[ "$(get_ssid "${iface}")" == "${WORK_SSID}" ]]; then
+        switch_location "work" "${ip_addr}" "${iface}"
     else
-        switch_location "non-work" "$ip_addr"
+        switch_location "non-work" "${ip_addr}" "${iface}"
     fi
 
-    finish "$iface" "$ip_addr"
+    finish "${iface}" "${ip_addr}"
 }
 
-# If script is called directly, invoke main
-if (($# == 0)); then
-    main
-else
-    main "$@"
-fi
-
+main "$@"
 exit 0
