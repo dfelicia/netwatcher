@@ -356,6 +356,9 @@ quit_program() {
         return
     fi
 
+    # Don't trap non-zero exit codes for this function
+    set +e
+
     # Use AppleScript to quit if it's an app
     if [[ -d "${client_path}" ]]; then
         osascript <<EOF >/dev/null 2>&1 &
@@ -381,6 +384,9 @@ EOF
             pgrep ciscod >/dev/null && check_sudo_access && sudo pkill -f ciscod >/dev/null 2>&1
         fi
     fi
+
+    # Re-set our trap to catch errors again
+    set -e
 
     log_msg "${friendly_name}: stopped"
 }
